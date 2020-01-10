@@ -131,6 +131,8 @@ const char *string_of_NPError(int error)
 	_(NPERR_FILE_NOT_FOUND);
 	_(NPERR_NO_DATA);
 	_(NPERR_STREAM_NOT_SEEKABLE);
+	_(NPERR_TIME_RANGE_NOT_SUPPORTED);
+	_(NPERR_MALFORMED_SITE);
 #undef _
   default:
 	str = "<unknown error>";
@@ -247,6 +249,12 @@ const char *string_of_NPPVariable(int variable)
 	_(NPPVpluginNeedsXEmbed);
 	_(NPPVpluginScriptableNPObject);
 	_(NPPVformValue);
+	_(NPPVpluginUrlRequestsDisplayedBool);
+	_(NPPVpluginWantsAllNetworkStreams);
+	_(NPPVpluginNativeAccessibleAtkPlugId);
+	_(NPPVpluginCancelSrcStream);
+	_(NPPVsupportsAdvancedKeyHandling);
+	_(NPPVpluginUsesDOMForCursorBool);
 #undef _
   default:
 	switch (variable & 0xff) {
@@ -283,6 +291,9 @@ const char *string_of_NPNVariable(int variable)
 	_(NPNVWindowNPObject);
 	_(NPNVPluginElementNPObject);
 	_(NPNVSupportsWindowless);
+	_(NPNVprivateModeBool);
+	_(NPNVsupportsAdvancedKeyHandling);
+	_(NPNVdocumentOrigin);
 #undef _
   default:
 	switch (variable & 0xff) {
@@ -296,6 +307,40 @@ const char *string_of_NPNVariable(int variable)
 	  str = "<unknown variable>";
 	  break;
 	}
+	break;
+  }
+
+  return str;
+}
+
+const char *string_of_NPNURLVariable(int variable)
+{
+  const char *str;
+
+  switch (variable) {
+#define _(VAL) case VAL: str = #VAL; break;
+	_(NPNURLVCookie);
+	_(NPNURLVProxy);
+#undef _
+  default:
+	str = "<unknown variable>";
+	break;
+  }
+
+  return str;
+}
+
+const char *string_of_NPWindowType(int type)
+{
+  const char *str;
+
+  switch (type) {
+#define _(VAL) case VAL: str = #VAL; break;
+	_(NPWindowTypeWindow);
+	_(NPWindowTypeDrawable);
+#undef _
+  default:
+	str = "<unknown type>";
 	break;
   }
 
@@ -326,25 +371,6 @@ const char *npw_strerror(int error)
   }
 
   return "Unknown error";
-}
-
-char *npw_asprintf(const char *format, ...)
-{
-  va_list args;
-  va_start(args, format);
-  int alen = vsnprintf(NULL, 0, format, args);
-  va_end(args);
-  char *str = malloc(alen+1);
-  if (str == NULL)
-	return NULL;
-  va_start(args, format);
-  int rlen = vsnprintf(str, alen+1, format, args);
-  va_end(args);
-  if (rlen != alen) {
-	free(str);
-	return NULL;
-  }
-  return str;
 }
 
 /* Return 1 + max value the system can allocate to a new fd */

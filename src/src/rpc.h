@@ -21,6 +21,8 @@
 #ifndef RPC_H
 #define RPC_H
 
+#include <glib.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -57,7 +59,11 @@ extern int rpc_listen_socket(rpc_connection_t *connection) attribute_hidden;
 extern int rpc_listen(rpc_connection_t *connection) attribute_hidden;
 extern int rpc_dispatch(rpc_connection_t *connection) attribute_hidden;
 extern int rpc_wait_dispatch(rpc_connection_t *connection, int timeout) attribute_hidden;
+extern int rpc_dispatch_pending_sync(rpc_connection_t *connection) attribute_hidden;
 extern int rpc_socket(rpc_connection_t *connection) attribute_hidden;
+
+extern int rpc_sync(rpc_connection_t *connection) attribute_hidden;
+extern int rpc_end_sync(rpc_connection_t *connection) attribute_hidden;
 
 enum {
   RPC_STATUS_BROKEN						= -1,
@@ -120,6 +126,10 @@ extern int rpc_method_wait_for_reply(rpc_connection_t *connection, ...) attribut
 extern int rpc_method_get_args(rpc_connection_t *connection, ...) attribute_hidden;
 extern int rpc_method_send_reply(rpc_connection_t *connection, ...) attribute_hidden;
 
+// Sources
+extern GSource *rpc_event_source_new(rpc_connection_t *connection) attribute_hidden;
+extern GSource *rpc_sync_source_new(rpc_connection_t *connection) attribute_hidden;
+
 #ifdef __cplusplus
 }
 #endif
@@ -128,6 +138,6 @@ extern int rpc_method_send_reply(rpc_connection_t *connection, ...) attribute_hi
 typedef void (*rpc_error_callback_t)(rpc_connection_t *connection, void *user_data);
 
 // Set error callback for a connection
-void rpc_connection_set_error_callback(rpc_connection_t *connection, rpc_error_callback_t callback, void *callback_data);
+void rpc_connection_set_error_callback(rpc_connection_t *connection, rpc_error_callback_t callback, void *callback_data) attribute_hidden;
 
 #endif /* RPC_H */

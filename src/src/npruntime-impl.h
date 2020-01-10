@@ -2,6 +2,7 @@
  *  npruntime.c - Scripting plugins support
  *
  *  nspluginwrapper (C) 2005-2009 Gwenole Beauchesne
+ *                  (C) 2011 David Benjamin
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -21,46 +22,48 @@
 #ifndef NPRUNTIME_IMPL_H
 #define NPRUNTIME_IMPL_H
 
-// NPObjectInfo is used to hold additional information for an NPObject instance
-typedef struct {
-  NPObject *npobj;
-  uint32_t npobj_id;
-  bool is_valid;
-  void *plugin;
-  void *hasMethod_cache;
-} NPObjectInfo;
+// npruntime bridge system inspired by Chromium's proxy/stub setup.
 
-extern NPObjectInfo *npobject_info_new(NPObject *npobj) attribute_hidden;
-extern void npobject_info_destroy(NPObjectInfo *npobj_info) attribute_hidden;
-extern NPObjectInfo *npobject_info_lookup(NPObject *npobj) attribute_hidden;
-
-extern NPObject *npobject_new(uint32_t npobj_id, NPP instance, NPClass *class) attribute_hidden;
-extern void npobject_destroy(NPObject *npobj) attribute_hidden;
-extern NPObject *npobject_lookup(uint32_t npobj_id) attribute_hidden;
-extern void npobject_associate(NPObject *npobj, NPObjectInfo *npobj_info) attribute_hidden;
-
+// Init and shutdown of the NPObject bridge system.
 extern bool npobject_bridge_new(void) attribute_hidden;
 extern void npobject_bridge_destroy(void) attribute_hidden;
 
-extern NPClass npclass_bridge;
+extern int npclass_add_method_descriptors(rpc_connection_t *connection) attribute_hidden;
 
-extern int npclass_handle_Invalidate(rpc_connection_t *connection) attribute_hidden;
-extern int npclass_handle_HasMethod(rpc_connection_t *connection) attribute_hidden;
-extern int npclass_handle_Invoke(rpc_connection_t *connection) attribute_hidden;
-extern int npclass_handle_InvokeDefault(rpc_connection_t *connection) attribute_hidden;
-extern int npclass_handle_HasProperty(rpc_connection_t *connection) attribute_hidden;
-extern int npclass_handle_GetProperty(rpc_connection_t *connection) attribute_hidden;
-extern int npclass_handle_SetProperty(rpc_connection_t *connection) attribute_hidden;
-extern int npclass_handle_RemoveProperty(rpc_connection_t *connection) attribute_hidden;
-extern int npclass_handle_Invalidate(rpc_connection_t *connection) attribute_hidden;
+// Management of stubs, objects which live on the side that owns the
+// NPObject and holds a reference to it on behalf of a proxy.
+extern uint32_t npobject_create_stub(NPObject *npobj) attribute_hidden;
+extern void npobject_destroy_stub(uint32_t id) attribute_hidden;
+extern NPObject *npobject_lookup_local(uint32_t id) attribute_hidden;
+
+// Create a proxy object. The received id must correspond to a live
+// stub in the other process. Deallocating this object releases its
+// corresponding stub. Holds a reference to the other NPObject on via
+// its stub.
+extern NPObject *npobject_create_proxy(NPP npp, uint32_t id) attribute_hidden;
+extern bool npobject_is_proxy(NPObject *npobj) attribute_hidden;
+extern uint32_t npobject_get_proxy_id(NPObject *npobj) attribute_hidden;
+extern void npobject_destroy_proxy(NPObject *npobj, bool release_stub) attribute_hidden;
+
+#if NPW_IS_PLUGIN
+// Firefox requires that NPN_CreateObject be called with a real NPP
+// pointer, so we keep track of the ownership of NPObjects. This
+// mapping also doubles as a way of tracking if they've been invalidated.
+extern void npobject_register(NPObject *npobj, void *plugin) attribute_hidden;
+extern bool npobject_is_registered(NPObject *npobj) attribute_hidden;
+extern void *npobject_get_owner(NPObject *npobj) attribute_hidden;
+extern void npobject_unregister(NPObject *npobj) attribute_hidden;
+#endif
 
 struct _NPVariant;
 extern void npvariant_clear(struct _NPVariant *variant) attribute_hidden;
 extern char *string_of_NPVariant(const struct _NPVariant *arg) attribute_hidden;
 extern void print_npvariant_args(const struct _NPVariant *args, uint32_t nargs) attribute_hidden;
 
+#if NPW_IS_BROWSER
 // Deactivate all NPObject instances
 extern void npruntime_deactivate(void) attribute_hidden;
+#endif
 
 // Check whether to use NPRuntime data caching
 // (on by default, disabled with NPW_NPRUNTIME_CACHE=0|no)

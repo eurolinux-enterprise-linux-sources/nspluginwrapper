@@ -2,6 +2,7 @@
  *  npw-viewer.c - Target plugin loader and viewer
  *
  *  nspluginwrapper (C) 2005-2009 Gwenole Beauchesne
+ *                  (C) 2011 David Benjamin
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -51,14 +52,8 @@
 #include "debug.h"
 
 
-// [UNIMPLEMENTED] Define to use XPCOM emulation
-#define USE_XPCOM 0
-
 // Define to use XEMBED hack (don't let browser kill our window)
 #define USE_XEMBED_HACK 1
-
-// Define to allow windowless plugins
-#define ALLOW_WINDOWLESS_PLUGINS 1
 
 // Define to use NPIdentifier cache
 #define USE_NPIDENTIFIER_CACHE 1
@@ -70,6 +65,9 @@ rpc_connection_t *g_rpc_connection attribute_hidden = NULL;
 // Viewer main thread - make sure we call into the browser from the main thread
 static pthread_t g_main_thread = 0;
 
+// True as long as the event loop is running.
+static bool g_is_running = false;
+
 // Instance state information about the plugin
 typedef struct _PluginInstance {
   NPW_DECL_PLUGIN_INSTANCE;
@@ -79,6 +77,9 @@ typedef struct _PluginInstance {
   uint32_t width, height;
   void *toolkit_data;
   GdkWindow *browser_toplevel;
+  uint32_t next_timer_id;
+  GHashTable *timers;
+  GHashTable *npobjects;
 } PluginInstance;
 
 #define PLUGIN_INSTANCE(instance) \
@@ -105,10 +106,18 @@ typedef struct _GtkData {
   GtkWidget *socket;
 } GtkData;
 
+// Timer information
+typedef struct _Timer {
+  bool repeat;
+  void (*func)(NPP npp, uint32_t timerID);
+  guint source_id;
+} Timer;
+
 // Prototypes
 static void destroy_window(PluginInstance *plugin);
 static int xt_source_create(void);
 static void xt_source_destroy(void);
+static void timer_free(Timer *timer);
 
 
 /* ====================================================================== */
@@ -147,6 +156,12 @@ static void plugin_instance_finalize(PluginInstance *plugin)
   if (plugin->instance) {
 	free(plugin->instance);
 	plugin->instance = NULL;
+  }
+  if (plugin->timers) {
+	g_hash_table_destroy(plugin->timers);
+  }
+  if (plugin->npobjects) {
+	g_hash_table_destroy(plugin->npobjects);
   }
 }
 
@@ -204,80 +219,6 @@ bool thread_check(void)
 	return (g_main_thread == pthread_self());
 #endif
   return true;
-}
-
-// Delayed calls machinery
-// XXX: use a pipe, this should be faster (avoids GSource creation and
-// explicit memory allocation)
-enum {
-  RPC_DELAYED_NPN_RELEASE_OBJECT = 1
-};
-
-typedef struct _DelayedCall {
-  gint type;
-  gpointer data;
-} DelayedCall;
-
-static GList *g_delayed_calls = NULL;
-static guint g_delayed_calls_id = 0;
-
-static void g_NPN_ReleaseObject_Now(NPObject *npobj);
-static gboolean delayed_calls_process_cb(gpointer user_data);
-
-static void delayed_calls_add(int type, gpointer data)
-{
-  DelayedCall *dcall = NPW_MemNew(DelayedCall, 1);
-  if (dcall == NULL)
-	return;
-  dcall->type = type;
-  dcall->data = data;
-  g_delayed_calls = g_list_append(g_delayed_calls, dcall);
-
-  if (g_delayed_calls_id == 0)
-	g_delayed_calls_id = g_idle_add_full(G_PRIORITY_LOW,
-										 delayed_calls_process_cb, NULL, NULL);
-}
-
-// Returns whether there are pending calls left in the queue
-static gboolean delayed_calls_process(PluginInstance *plugin, gboolean is_in_NPP_Destroy)
-{
-  GList *l = g_delayed_calls;
-  while (l != NULL) {
-	GList *cl = l;
-	l = l->next;
-
-	if (!is_in_NPP_Destroy) {
-	  /* Continue later if there is incoming RPC */
-	  if (rpc_wait_dispatch(g_rpc_connection, 0) > 0)
-		return TRUE;
-	}
-
-	DelayedCall *dcall = (DelayedCall *)cl->data;
-	switch (dcall->type) {
-	case RPC_DELAYED_NPN_RELEASE_OBJECT:
-	  {
-		NPObject *npobj = (NPObject *)dcall->data;
-		g_NPN_ReleaseObject_Now(npobj);
-		break;
-	  }
-	}
-	NPW_MemFree(dcall);
-	g_delayed_calls = g_list_delete_link(g_delayed_calls, cl);
-  }
-
-  if (g_delayed_calls)
-	return TRUE;
-
-  if (g_delayed_calls_id) {
-	g_source_remove(g_delayed_calls_id);
-	g_delayed_calls_id = 0;
-  }
-  return FALSE;
-}
-
-static gboolean delayed_calls_process_cb(gpointer user_data)
-{
-  return delayed_calls_process(NULL, FALSE);
 }
 
 // NPIdentifier cache
@@ -743,26 +684,6 @@ static void xt_client_event_handler(Widget w, XtPointer client_data, XEvent *eve
 
 
 /* ====================================================================== */
-/* === XPCOM glue                                                     === */
-/* ====================================================================== */
-
-#if defined(__GNUC__) && (__GNUC__ > 2)
-#define NS_LIKELY(x)    (__builtin_expect((x), 1))
-#define NS_UNLIKELY(x)  (__builtin_expect((x), 0))
-#else
-#define NS_LIKELY(x)    (x)
-#define NS_UNLIKELY(x)  (x)
-#endif
-
-#define NS_FAILED(_nsresult) (NS_UNLIKELY((_nsresult) & 0x80000000))
-#define NS_SUCCEEDED(_nsresult) (NS_LIKELY(!((_nsresult) & 0x80000000)))
-
-typedef uint32 nsresult;
-typedef struct nsIServiceManager nsIServiceManager;
-extern nsresult NS_GetServiceManager(nsIServiceManager **result);
-
-
-/* ====================================================================== */
 /* === Window utilities                                               === */
 /* ====================================================================== */
 
@@ -852,13 +773,9 @@ static int create_window(PluginInstance *plugin, NPWindow *window)
 	if (toolkit == NULL)
 	  return -1;
 	toolkit->container = gtk_plug_new((GdkNativeWindow)window->window);
-	if (toolkit->container == NULL)
-	  return -1;
 	gtk_widget_set_size_request(toolkit->container, window->width, window->height); 
 	gtk_widget_show(toolkit->container);
 	toolkit->socket = gtk_socket_new();
-	if (toolkit->socket == NULL)
-	  return -1;
 	gtk_widget_show(toolkit->socket);
 	gtk_container_add(GTK_CONTAINER(toolkit->container), toolkit->socket);
 	gtk_widget_show_all(toolkit->container);
@@ -1169,19 +1086,42 @@ invoke_NPN_GetValue(PluginInstance *plugin, NPNVariable variable, void *value)
 		ret = NPERR_GENERIC_ERROR;
 	  }
 	  D(bug("-> value: %s\n", b ? "true" : "false"));
-	  *((PRBool *)value) = b ? PR_TRUE : PR_FALSE;
+	  *((NPBool *)value) = b ? TRUE : FALSE;
+	  break;
+	}
+  case RPC_TYPE_STRING:
+	{
+	  char *str = NULL;
+	  error = rpc_method_wait_for_reply(g_rpc_connection, RPC_TYPE_INT32, &ret, RPC_TYPE_STRING, &str, RPC_TYPE_INVALID);
+	  if (error != RPC_ERROR_NO_ERROR) {
+		npw_perror("NPN_GetValue() wait for reply", error);
+		ret = NPERR_GENERIC_ERROR;
+	  }
+	  D(bug("-> value: %s\n", str ? str : "(null)"));
+	  // Reallocate with NPN_MemAlloc. Caller frees.
+	  if (ret == NPERR_NO_ERROR) {
+		char *npn_str = NULL;
+		ret = NPW_ReallocData(str, strlen(str) + 1, (void**)&npn_str);
+		free(str);
+		str = npn_str;
+	  }
+	  *((char **)value) = str;
 	  break;
 	}
   case RPC_TYPE_NP_OBJECT:
 	{
 	  NPObject *npobj = NULL;
-	  error = rpc_method_wait_for_reply(g_rpc_connection, RPC_TYPE_INT32, &ret, RPC_TYPE_NP_OBJECT, &npobj, RPC_TYPE_INVALID);
+	  error = rpc_method_wait_for_reply(g_rpc_connection,
+										RPC_TYPE_INT32, &ret,
+										RPC_TYPE_NP_OBJECT_PASS_REF, &npobj,
+										RPC_TYPE_INVALID);
 	  if (error != RPC_ERROR_NO_ERROR) {
 		npw_perror("NPN_GetValue() wait for reply", error);
 		ret = NPERR_GENERIC_ERROR;
 	  }
 	  D(bug("-> value: <object %p>\n", npobj));
 	  *((NPObject **)value) = npobj;
+	  // Caller releases NPObject reference.
 	  break;
 	}
   }
@@ -1226,22 +1166,6 @@ g_NPN_GetValue(NPP instance, NPNVariable variable, void *value)
   case NPNVToolkit:
 	*(NPNToolkitType *)value = NPW_TOOLKIT;
 	break;
-#if USE_XPCOM
-  case NPNVserviceManager: {
-	nsIServiceManager *sm;
-	int ret = NS_GetServiceManager(&sm);
-	if (NS_FAILED(ret)) {
-	  npw_printf("WARNING: NS_GetServiceManager failed\n");
-	  return NPERR_GENERIC_ERROR;
-	}
-	*(nsIServiceManager **)value = sm;
-	break;
-  }
-  case NPNVDOMWindow:
-  case NPNVDOMElement:
-	npw_printf("WARNING: %s is not supported by NPN_GetValue()\n", string_of_NPNVariable(variable));
-	return NPERR_INVALID_PARAM;
-#endif
   case NPNVnetscapeWindow:
 	if (plugin == NULL) {
 	  npw_printf("ERROR: NPNVnetscapeWindow requires a non NULL instance\n");
@@ -1260,12 +1184,17 @@ g_NPN_GetValue(NPP instance, NPNVariable variable, void *value)
 	}
 	*((GdkNativeWindow *)value) = GDK_WINDOW_XWINDOW(plugin->browser_toplevel);
 	break;
-#if ALLOW_WINDOWLESS_PLUGINS
+  // TODO: when AdvancedKeyHandling hooks are supported, proxy this value over
+  // from the browser.
+  case NPNVsupportsAdvancedKeyHandling:
+	*(NPBool*)value = FALSE;
+	break;
   case NPNVSupportsWindowless:
-#endif
   case NPNVSupportsXEmbedBool:
   case NPNVWindowNPObject:
   case NPNVPluginElementNPObject:
+  case NPNVprivateModeBool:
+  case NPNVdocumentOrigin:
 	return g_NPN_GetValue_real(instance, variable, value);
   default:
 	switch (variable & 0xff) {
@@ -1277,7 +1206,7 @@ g_NPN_GetValue(NPP instance, NPNVariable variable, void *value)
 	  }
 	  break;
 	}
-	npw_printf("WARNING: unhandled variable %d (%s) in NPN_GetValue()\n", variable, string_of_NPNVariable(variable));
+	D(bug("WARNING: unhandled variable %d (%s) in NPN_GetValue()\n", variable, string_of_NPNVariable(variable)));
 	return NPERR_INVALID_PARAM;
   }
 
@@ -1327,7 +1256,11 @@ g_NPN_InvalidateRect(NPP instance, NPRect *invalidRect)
   if (invalidRect == NULL)
 	return;
 
-  D(bugiI("NPN_InvalidateRect instance=%p\n", PLUGIN_INSTANCE_NPP(plugin)));
+  D(bugiI("NPN_InvalidateRect instance=%p "
+		  "rect.top=%d rect.left=%d rect.bottom=%d rect.right=%d\n",
+		  PLUGIN_INSTANCE_NPP(plugin),
+		  invalidRect->top, invalidRect->left,
+		  invalidRect->bottom, invalidRect->right));
   npw_plugin_instance_ref(plugin);
   invoke_NPN_InvalidateRect(plugin, invalidRect);
   npw_plugin_instance_unref(plugin);
@@ -1345,7 +1278,7 @@ g_NPN_InvalidateRegion(NPP instance, NPRegion invalidRegion)
 
 // Allocates memory from the browser's memory space
 static void *
-g_NPN_MemAlloc(uint32 size)
+g_NPN_MemAlloc(uint32_t size)
 {
   D(bugiI("NPN_MemAlloc size=%d\n", size));
 
@@ -1355,8 +1288,8 @@ g_NPN_MemAlloc(uint32 size)
 }
 
 // Requests that the browser free a specified amount of memory
-static uint32
-g_NPN_MemFlush(uint32 size)
+static uint32_t
+g_NPN_MemFlush(uint32_t size)
 {
   D(bug("NPN_MemFlush size=%d\n", size));
   return 0;
@@ -1373,7 +1306,7 @@ g_NPN_MemFree(void *ptr)
 
 // Posts data to a URL
 static NPError
-invoke_NPN_PostURL(PluginInstance *plugin, const char *url, const char *target, uint32 len, const char *buf, NPBool file)
+invoke_NPN_PostURL(PluginInstance *plugin, const char *url, const char *target, uint32_t len, const char *buf, NPBool file)
 {
   npw_return_val_if_fail(rpc_method_invoke_possible(g_rpc_connection),
 						 NPERR_GENERIC_ERROR);
@@ -1404,7 +1337,7 @@ invoke_NPN_PostURL(PluginInstance *plugin, const char *url, const char *target, 
 }
 
 static NPError
-g_NPN_PostURL(NPP instance, const char *url, const char *target, uint32 len, const char *buf, NPBool file)
+g_NPN_PostURL(NPP instance, const char *url, const char *target, uint32_t len, const char *buf, NPBool file)
 {
   if (!thread_check()) {
 	npw_printf("WARNING: NPN_PostURL not called from the main thread\n");
@@ -1428,7 +1361,7 @@ g_NPN_PostURL(NPP instance, const char *url, const char *target, uint32 len, con
 
 // Posts data to a URL, and receives notification of the result
 static NPError
-invoke_NPN_PostURLNotify(PluginInstance *plugin, const char *url, const char *target, uint32 len, const char *buf, NPBool file, void *notifyData)
+invoke_NPN_PostURLNotify(PluginInstance *plugin, const char *url, const char *target, uint32_t len, const char *buf, NPBool file, void *notifyData)
 {
   npw_return_val_if_fail(rpc_method_invoke_possible(g_rpc_connection),
 						 NPERR_GENERIC_ERROR);
@@ -1460,7 +1393,7 @@ invoke_NPN_PostURLNotify(PluginInstance *plugin, const char *url, const char *ta
 }
 
 static NPError
-g_NPN_PostURLNotify(NPP instance, const char *url, const char *target, uint32 len, const char *buf, NPBool file, void *notifyData)
+g_NPN_PostURLNotify(NPP instance, const char *url, const char *target, uint32_t len, const char *buf, NPBool file, void *notifyData)
 {
   if (!thread_check()) {
 	npw_printf("WARNING: NPN_PostURLNotify not called from the main thread\n");
@@ -1492,7 +1425,7 @@ g_NPN_ReloadPlugins(NPBool reloadPages)
 }
 
 // Returns the Java execution environment
-static JRIEnv *
+static void *
 g_NPN_GetJavaEnv(void)
 {
   D(bug("NPN_GetJavaEnv\n"));
@@ -1501,7 +1434,7 @@ g_NPN_GetJavaEnv(void)
 }
 
 // Returns the Java object associated with the plug-in instance
-static jref
+static void *
 g_NPN_GetJavaPeer(NPP instance)
 {
   D(bug("NPN_GetJavaPeer instance=%p\n", instance));
@@ -1563,7 +1496,7 @@ invoke_NPN_SetValue(PluginInstance *plugin, NPPVariable variable, void *value)
   case RPC_TYPE_BOOLEAN:
 	break;
   default:
-	npw_printf("WARNING: unhandled variable %d in NPN_SetValue()\n", variable);
+	D(bug("WARNING: unhandled variable %d in NPN_SetValue()\n", variable));
 	return NPERR_INVALID_PARAM;
   }
 
@@ -1876,7 +1809,7 @@ g_NPN_DestroyStream(NPP instance, NPStream *stream, NPError reason)
 
 // Pushes data into a stream produced by the plug-in and consumed by the browser
 static int
-invoke_NPN_Write(PluginInstance *plugin, NPStream *stream, int32 len, void *buf)
+invoke_NPN_Write(PluginInstance *plugin, NPStream *stream, int32_t len, void *buf)
 {
   npw_return_val_if_fail(rpc_method_invoke_possible(g_rpc_connection), -1);
 
@@ -1905,8 +1838,8 @@ invoke_NPN_Write(PluginInstance *plugin, NPStream *stream, int32 len, void *buf)
   return ret;
 }
 
-static int32
-g_NPN_Write(NPP instance, NPStream *stream, int32 len, void *buf)
+static int32_t
+g_NPN_Write(NPP instance, NPStream *stream, int32_t len, void *buf)
 {
   if (!thread_check()) {
 	npw_printf("WARNING: NPN_Write not called from the main thread\n");
@@ -1925,7 +1858,7 @@ g_NPN_Write(NPP instance, NPStream *stream, int32 len, void *buf)
 
   D(bugiI("NPN_Write instance=%p, stream=%p, len=%d, buf=%p\n", instance, stream, len, buf));
   npw_plugin_instance_ref(plugin);
-  int32 ret = invoke_NPN_Write(plugin, stream, len, buf);
+  int32_t ret = invoke_NPN_Write(plugin, stream, len, buf);
   npw_plugin_instance_unref(plugin);
   D(bugiD("NPN_Write return: %d\n", ret));
   return ret;
@@ -2025,35 +1958,6 @@ g_NPN_PopPopupsEnabledState(NPP instance)
 /* === NPRuntime glue                                                 === */
 /* ====================================================================== */
 
-// Allocates a new NPObject
-static uint32_t
-invoke_NPN_CreateObject(PluginInstance *plugin)
-{
-  npw_return_val_if_fail(rpc_method_invoke_possible(g_rpc_connection), 0);
-
-  int error = rpc_method_invoke(g_rpc_connection,
-								RPC_METHOD_NPN_CREATE_OBJECT,
-								RPC_TYPE_NPW_PLUGIN_INSTANCE, plugin,
-								RPC_TYPE_INVALID);
-
-  if (error != RPC_ERROR_NO_ERROR) {
-	npw_perror("NPN_CreateObject() invoke", error);
-	return 0;
-  }
-
-  uint32_t npobj_id = 0;
-  error = rpc_method_wait_for_reply(g_rpc_connection,
-									RPC_TYPE_UINT32, &npobj_id,
-									RPC_TYPE_INVALID);
-
-  if (error != RPC_ERROR_NO_ERROR) {
-	npw_perror("NPN_CreateObject() wait for reply", error);
-	return 0;
-  }
-
-  return npobj_id;
-}
-
 static NPObject *
 g_NPN_CreateObject(NPP instance, NPClass *class)
 {
@@ -2062,52 +1966,33 @@ g_NPN_CreateObject(NPP instance, NPClass *class)
 	return NULL;
   }
   
-  if (instance == NULL)
-	return NULL;
-
-  PluginInstance *plugin = PLUGIN_INSTANCE(instance);
-  if (plugin == NULL)
-	return NULL;
-
   if (class == NULL)
 	return NULL;
 
-  D(bugiI("NPN_CreateObject\n"));
-  npw_plugin_instance_ref(plugin);
-  uint32_t npobj_id = invoke_NPN_CreateObject(plugin);
-  npw_plugin_instance_unref(plugin);
-  assert(npobj_id != 0);
-  NPObject *npobj = npobject_new(npobj_id, instance, class);
-  D(bugiD("NPN_CreateObject return: %p (refcount: %d)\n", npobj, npobj->referenceCount));
+  PluginInstance *plugin = PLUGIN_INSTANCE(instance);
+
+  D(bugiI("NPN_CreateObject instance=%p, plugin=%p\n", instance, plugin));
+
+  NPObject *npobj;
+  if (class->allocate)
+	npobj = class->allocate(instance, class);
+  else
+	npobj = malloc(sizeof(*npobj));
+  if (npobj) {
+	npobj->_class = class;
+	npobj->referenceCount = 1;
+
+	// We specifically cannot call npobject_get_proxy_id here because
+	// the proxy has only been allocated, not constructed. (Sigh.)
+	if (!npobject_is_proxy(npobj)) {
+	  // Register anything that isn't a proxy.
+	  npobject_register(npobj, plugin);
+	  if (plugin)
+		g_hash_table_insert(plugin->npobjects, npobj, npobj);
+	}
+  }
+  D(bugiD("NPN_CreateObject return: %p\n", npobj));
   return npobj;
-}
-
-// Increments the reference count of the given NPObject
-static uint32_t
-invoke_NPN_RetainObject(NPObject *npobj)
-{
-  npw_return_val_if_fail(rpc_method_invoke_possible(g_rpc_connection),
-						 npobj->referenceCount);
-
-  int error = rpc_method_invoke(g_rpc_connection,
-								RPC_METHOD_NPN_RETAIN_OBJECT,
-								RPC_TYPE_NP_OBJECT, npobj,
-								RPC_TYPE_INVALID);
-
-  if (error != RPC_ERROR_NO_ERROR) {
-	npw_perror("NPN_RetainObject() invoke", error);
-	return npobj->referenceCount;
-  }
-
-  uint32_t refcount;
-  error = rpc_method_wait_for_reply(g_rpc_connection, RPC_TYPE_UINT32, &refcount, RPC_TYPE_INVALID);
-
-  if (error != RPC_ERROR_NO_ERROR) {
-	npw_perror("NPN_RetainObject() wait for reply", error);
-	return npobj->referenceCount;
-  }
-
-  return refcount;
 }
 
 static NPObject *
@@ -2122,55 +2007,10 @@ g_NPN_RetainObject(NPObject *npobj)
 	return NULL;
 
   D(bugiI("NPN_RetainObject npobj=%p\n", npobj));
-  uint32_t refcount = invoke_NPN_RetainObject(npobj);
-  D(bugiD("NPN_RetainObject return: %p (refcount: %d)\n", npobj, refcount));
-  npobj->referenceCount = refcount;
+  npobj->referenceCount++;
+  D(bugiD("NPN_RetainObject return: %p (refcount: %d)\n", npobj,
+		  npobj->referenceCount));
   return npobj;
-}
-
-// Decrements the reference count of the give NPObject
-static uint32_t
-invoke_NPN_ReleaseObject(NPObject *npobj)
-{
-  npw_return_val_if_fail(rpc_method_invoke_possible(g_rpc_connection),
-						 npobj->referenceCount);
-
-  int error = rpc_method_invoke(g_rpc_connection,
-								RPC_METHOD_NPN_RELEASE_OBJECT,
-								RPC_TYPE_NP_OBJECT, npobj,
-								RPC_TYPE_INVALID);
-
-  if (error != RPC_ERROR_NO_ERROR) {
-	npw_perror("NPN_ReleaseObject() invoke", error);
-	return npobj->referenceCount;
-  }
-
-  uint32_t refcount;
-  error = rpc_method_wait_for_reply(g_rpc_connection, RPC_TYPE_UINT32, &refcount, RPC_TYPE_INVALID);
-
-  if (error != RPC_ERROR_NO_ERROR) {
-	npw_perror("NPN_ReleaseObject() wait for reply", error);
-	return npobj->referenceCount;
-  }
-
-  return refcount;
-}
-
-static void
-g_NPN_ReleaseObject_Now(NPObject *npobj)
-{
-  D(bugiI("NPN_ReleaseObject npobj=%p\n", npobj));
-  uint32_t refcount = invoke_NPN_ReleaseObject(npobj);
-  D(bugiD("NPN_ReleaseObject done (refcount: %d)\n", refcount));
-
-  if ((npobj->referenceCount = refcount) == 0)
-	npobject_destroy(npobj);
-}
-
-static void
-g_NPN_ReleaseObject_Delayed(NPObject *npobj)
-{
-  delayed_calls_add(RPC_DELAYED_NPN_RELEASE_OBJECT, npobj);
 }
 
 static void
@@ -2180,18 +2020,30 @@ g_NPN_ReleaseObject(NPObject *npobj)
 	npw_printf("WARNING: NPN_ReleaseObject not called from the main thread\n");
 	return;
   }
-	
+
   if (npobj == NULL)
 	return;
 
-  if (rpc_method_invoke_possible(g_rpc_connection)) {
-	D(bug("NPN_ReleaseObject <now>\n"));
-	g_NPN_ReleaseObject_Now(npobj);
+  D(bugiI("NPN_ReleaseObject npobj=%p\n", npobj));
+  npobj->referenceCount--;
+  uint32_t refcount = npobj->referenceCount;
+  if (npobj->referenceCount == 0) {
+#if NPW_IS_PLUGIN
+	PluginInstance *plugin = npobject_get_owner(npobj);
+	if (plugin) {
+	  // Unregister the owner, if not proxy.
+	  g_hash_table_remove(plugin->npobjects, npobj);
+	}
+	npobject_unregister(npobj);
+#endif
+	if (npobj) {
+	  if (npobj->_class && npobj->_class->deallocate)
+		npobj->_class->deallocate(npobj);
+	  else
+		free(npobj);
+	}
   }
-  else {
-	D(bug("NPN_ReleaseObject <delayed>\n"));
-	g_NPN_ReleaseObject_Delayed(npobj);
-  }
+  D(bugiD("NPN_ReleaseObject done (refcount: %d)\n", refcount));
 }
 
 // Invokes a method on the given NPObject
@@ -2205,7 +2057,7 @@ invoke_NPN_Invoke(PluginInstance *plugin, NPObject *npobj, NPIdentifier methodNa
 								RPC_METHOD_NPN_INVOKE,
 								RPC_TYPE_NPW_PLUGIN_INSTANCE, plugin,
 								RPC_TYPE_NP_OBJECT, npobj,
-								RPC_TYPE_NP_IDENTIFIER, methodName,
+								RPC_TYPE_NP_IDENTIFIER, &methodName,
 								RPC_TYPE_ARRAY, RPC_TYPE_NP_VARIANT, argCount, args,
 								RPC_TYPE_INVALID);
 
@@ -2217,7 +2069,7 @@ invoke_NPN_Invoke(PluginInstance *plugin, NPObject *npobj, NPIdentifier methodNa
   uint32_t ret;
   error = rpc_method_wait_for_reply(g_rpc_connection,
 									RPC_TYPE_UINT32, &ret,
-									RPC_TYPE_NP_VARIANT, result,
+									RPC_TYPE_NP_VARIANT_PASS_REF, result,
 									RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
@@ -2280,7 +2132,7 @@ invoke_NPN_InvokeDefault(PluginInstance *plugin, NPObject *npobj,
   uint32_t ret;
   error = rpc_method_wait_for_reply(g_rpc_connection,
 									RPC_TYPE_UINT32, &ret,
-									RPC_TYPE_NP_VARIANT, result,
+									RPC_TYPE_NP_VARIANT_PASS_REF, result,
 									RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
@@ -2342,7 +2194,7 @@ invoke_NPN_Evaluate(PluginInstance *plugin, NPObject *npobj, NPString *script, N
   uint32_t ret;
   error = rpc_method_wait_for_reply(g_rpc_connection,
 									RPC_TYPE_UINT32, &ret,
-									RPC_TYPE_NP_VARIANT, result,
+									RPC_TYPE_NP_VARIANT_PASS_REF, result,
 									RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
@@ -2371,7 +2223,7 @@ g_NPN_Evaluate(NPP instance, NPObject *npobj, NPString *script, NPVariant *resul
   if (!npobj)
 	return false;
 
-  if (!script || !script->utf8length || !script->utf8characters)
+  if (!script || !script->UTF8Length || !script->UTF8Characters)
 	return true; // nothing to evaluate
 
   D(bugiI("NPN_Evaluate instance=%p, npobj=%p\n", instance, npobj));
@@ -2395,7 +2247,7 @@ invoke_NPN_GetProperty(PluginInstance *plugin, NPObject *npobj, NPIdentifier pro
 								RPC_METHOD_NPN_GET_PROPERTY,
 								RPC_TYPE_NPW_PLUGIN_INSTANCE, plugin,
 								RPC_TYPE_NP_OBJECT, npobj,
-								RPC_TYPE_NP_IDENTIFIER, propertyName,
+								RPC_TYPE_NP_IDENTIFIER, &propertyName,
 								RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
@@ -2406,7 +2258,7 @@ invoke_NPN_GetProperty(PluginInstance *plugin, NPObject *npobj, NPIdentifier pro
   uint32_t ret;
   error = rpc_method_wait_for_reply(g_rpc_connection,
 									RPC_TYPE_UINT32, &ret,
-									RPC_TYPE_NP_VARIANT, result,
+									RPC_TYPE_NP_VARIANT_PASS_REF, result,
 									RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
@@ -2457,7 +2309,7 @@ invoke_NPN_SetProperty(PluginInstance *plugin, NPObject *npobj, NPIdentifier pro
 								RPC_METHOD_NPN_SET_PROPERTY,
 								RPC_TYPE_NPW_PLUGIN_INSTANCE, plugin,
 								RPC_TYPE_NP_OBJECT, npobj,
-								RPC_TYPE_NP_IDENTIFIER, propertyName,
+								RPC_TYPE_NP_IDENTIFIER, &propertyName,
 								RPC_TYPE_NP_VARIANT, value,
 								RPC_TYPE_INVALID);
 
@@ -2516,7 +2368,7 @@ invoke_NPN_RemoveProperty(PluginInstance *plugin, NPObject *npobj, NPIdentifier 
 								RPC_METHOD_NPN_REMOVE_PROPERTY,
 								RPC_TYPE_NPW_PLUGIN_INSTANCE, plugin,
 								RPC_TYPE_NP_OBJECT, npobj,
-								RPC_TYPE_NP_IDENTIFIER, propertyName,
+								RPC_TYPE_NP_IDENTIFIER, &propertyName,
 								RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
@@ -2573,7 +2425,7 @@ invoke_NPN_HasProperty(PluginInstance *plugin, NPObject *npobj, NPIdentifier pro
 								RPC_METHOD_NPN_HAS_PROPERTY,
 								RPC_TYPE_NPW_PLUGIN_INSTANCE, plugin,
 								RPC_TYPE_NP_OBJECT, npobj,
-								RPC_TYPE_NP_IDENTIFIER, propertyName,
+								RPC_TYPE_NP_IDENTIFIER, &propertyName,
 								RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
@@ -2630,7 +2482,7 @@ invoke_NPN_HasMethod(PluginInstance *plugin, NPObject *npobj, NPIdentifier metho
 								RPC_METHOD_NPN_HAS_METHOD,
 								RPC_TYPE_NPW_PLUGIN_INSTANCE, plugin,
 								RPC_TYPE_NP_OBJECT, npobj,
-								RPC_TYPE_NP_IDENTIFIER, methodName,
+								RPC_TYPE_NP_IDENTIFIER, &methodName,
 								RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
@@ -2674,6 +2526,141 @@ g_NPN_HasMethod(NPP instance, NPObject *npobj, NPIdentifier methodName)
   bool ret = invoke_NPN_HasMethod(plugin, npobj, methodName);
   npw_plugin_instance_unref(plugin);
   D(bugiD("NPN_HasMethod return: %d\n", ret));
+  return ret;
+}
+
+// Enumerate the methods and properties on a given NPObject.
+static bool
+invoke_NPN_Enumerate(PluginInstance *plugin, NPObject *npobj,
+					 NPIdentifier **identifiers, uint32_t *count)
+{
+  npw_return_val_if_fail(rpc_method_invoke_possible(g_rpc_connection), false);
+
+  int error = rpc_method_invoke(g_rpc_connection,
+								RPC_METHOD_NPN_ENUMERATE,
+								RPC_TYPE_NPW_PLUGIN_INSTANCE, plugin,
+								RPC_TYPE_NP_OBJECT, npobj,
+								RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_Enumerate() invoke", error);
+	return false;
+  }
+
+  uint32_t ret;
+  // For some inexplicably idiotic reason, rpc_method_wait_for_reply
+  // doesn't actually allocate returned data with NPN_MemAlloc.
+  uint32_t myCount = 0;
+  NPIdentifier *myIdentifiers = NULL;
+  error = rpc_method_wait_for_reply(g_rpc_connection,
+									RPC_TYPE_UINT32, &ret,
+									RPC_TYPE_ARRAY, RPC_TYPE_NP_IDENTIFIER, &myCount, &myIdentifiers,
+									RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_Enumerate() wait for reply", error);
+	return false;
+  }
+
+  *count = myCount;
+  if (ret) {
+	ret = NPW_ReallocData(myIdentifiers,
+						  sizeof(**identifiers) * myCount,
+						  (void**)identifiers) == NPERR_NO_ERROR;
+  }
+  if (myIdentifiers)
+	free(myIdentifiers);
+
+  return ret;
+}
+
+static bool
+g_NPN_Enumerate(NPP instance, NPObject *npobj,
+				NPIdentifier **identifiers, uint32_t *count)
+{
+  if (!thread_check()) {
+	npw_printf("WARNING: NPN_HasMethod not called from the main thread\n");
+	return false;
+  }
+
+  if (instance == NULL)
+	return false;
+
+  PluginInstance *plugin = PLUGIN_INSTANCE(instance);
+  if (plugin == NULL)
+	return false;
+
+  if (!npobj || !npobj->_class || !npobj->_class->enumerate)
+	return false;
+
+  D(bugiI("NPN_Enumerate instance=%p, npobj=%p\n", instance, npobj));
+  npw_plugin_instance_ref(plugin);
+  bool ret = invoke_NPN_Enumerate(plugin, npobj, identifiers, count);
+  npw_plugin_instance_unref(plugin);
+  D(bugiD("NPN_Enumerate return: %d\n", ret));
+  return ret;
+}
+
+// Treats a given NPObject as a constructor
+static bool
+invoke_NPN_Construct(PluginInstance *plugin, NPObject *npobj,
+					 const NPVariant *args, uint32_t argCount, NPVariant *result)
+{
+  npw_return_val_if_fail(rpc_method_invoke_possible(g_rpc_connection), false);
+
+  int error = rpc_method_invoke(g_rpc_connection,
+								RPC_METHOD_NPN_CONSTRUCT,
+								RPC_TYPE_NPW_PLUGIN_INSTANCE, plugin,
+								RPC_TYPE_NP_OBJECT, npobj,
+								RPC_TYPE_ARRAY, RPC_TYPE_NP_VARIANT, argCount, args,
+								RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_Construct() invoke", error);
+	return false;
+  }
+
+  uint32_t ret;
+  error = rpc_method_wait_for_reply(g_rpc_connection,
+									RPC_TYPE_UINT32, &ret,
+									RPC_TYPE_NP_VARIANT_PASS_REF, result,
+									RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_Construct() wait for reply", error);
+	return false;
+  }
+
+  return ret;
+}
+
+static bool
+g_NPN_Construct(NPP instance, NPObject *npobj,
+				const NPVariant *args, uint32_t argCount, NPVariant *result)
+{
+  if (!thread_check()) {
+	npw_printf("WARNING: NPN_Construct not called from the main thread\n");
+	return false;
+  }
+
+  if (instance == NULL)
+	return false;
+
+  PluginInstance *plugin = PLUGIN_INSTANCE(instance);
+  if (plugin == NULL)
+	return false;
+
+  if (!npobj || !npobj->_class || !npobj->_class->construct)
+	return false;
+
+  D(bugiI("NPN_Construct instance=%p, npobj=%p\n", instance, npobj));
+  print_npvariant_args(args, argCount);
+  npw_plugin_instance_ref(plugin);
+  bool ret = invoke_NPN_Construct(plugin, npobj, args, argCount, result);
+  npw_plugin_instance_unref(plugin);
+  gchar *result_str = string_of_NPVariant(result);
+  D(bugiD("NPN_Construct return: %d (%s)\n", ret, result_str));
+  g_free(result_str);
   return ret;
 }
 
@@ -2788,7 +2775,7 @@ g_NPN_GetStringIdentifier(const NPUTF8 *name)
 
 // Returns an array of opaque identifiers for the names that are passed in
 static void
-invoke_NPN_GetStringIdentifiers(const NPUTF8 **names, uint32_t nameCount, NPIdentifier *identifiers)
+invoke_NPN_GetStringIdentifiers(const NPUTF8 **names, int32_t nameCount, NPIdentifier *identifiers)
 {
   npw_return_if_fail(rpc_method_invoke_possible(g_rpc_connection));
 
@@ -2826,7 +2813,7 @@ invoke_NPN_GetStringIdentifiers(const NPUTF8 **names, uint32_t nameCount, NPIden
 }
 
 static void
-cached_NPN_GetStringIdentifiers(const NPUTF8 **names, uint32_t nameCount, NPIdentifier *identifiers)
+cached_NPN_GetStringIdentifiers(const NPUTF8 **names, int32_t nameCount, NPIdentifier *identifiers)
 {
   /* XXX: could be optimized further */
   invoke_NPN_GetStringIdentifiers(names, nameCount, identifiers);
@@ -2845,7 +2832,7 @@ cached_NPN_GetStringIdentifiers(const NPUTF8 **names, uint32_t nameCount, NPIden
 }
 
 static void
-g_NPN_GetStringIdentifiers(const NPUTF8 **names, uint32_t nameCount, NPIdentifier *identifiers)
+g_NPN_GetStringIdentifiers(const NPUTF8 **names, int32_t nameCount, NPIdentifier *identifiers)
 {
   if (!thread_check()) {
 	npw_printf("WARNING: NPN_GetStringIdentifiers not called from the main thread\n");
@@ -2930,7 +2917,7 @@ invoke_NPN_IdentifierIsString(NPIdentifier identifier)
 
   int error = rpc_method_invoke(g_rpc_connection,
 								RPC_METHOD_NPN_IDENTIFIER_IS_STRING,
-								RPC_TYPE_NP_IDENTIFIER, identifier,
+								RPC_TYPE_NP_IDENTIFIER, &identifier,
 								RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
@@ -2975,7 +2962,7 @@ g_NPN_IdentifierIsString(NPIdentifier identifier)
   }
   
   D(bugiI("NPN_IdentifierIsString identifier=%p\n", identifier));
-  bool ret = invoke_NPN_IdentifierIsString(identifier);
+  bool ret = cached_NPN_IdentifierIsString(identifier);
   D(bugiD("NPN_IdentifierIsString return: %d\n", ret));
   return ret;
 }
@@ -2988,7 +2975,7 @@ invoke_NPN_UTF8FromIdentifier(NPIdentifier identifier)
 
   int error = rpc_method_invoke(g_rpc_connection,
 								RPC_METHOD_NPN_UTF8_FROM_IDENTIFIER,
-								RPC_TYPE_NP_IDENTIFIER, identifier,
+								RPC_TYPE_NP_IDENTIFIER, &identifier,
 								RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
@@ -3051,7 +3038,7 @@ invoke_NPN_IntFromIdentifier(NPIdentifier identifier)
 
   int error = rpc_method_invoke(g_rpc_connection,
 								RPC_METHOD_NPN_INT_FROM_IDENTIFIER,
-								RPC_TYPE_NP_IDENTIFIER, identifier,
+								RPC_TYPE_NP_IDENTIFIER, &identifier,
 								RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
@@ -3109,6 +3096,377 @@ g_NPN_IntFromIdentifier(NPIdentifier identifier)
   return ret;
 }
 
+typedef struct _AsyncCall {
+  PluginInstance *plugin;
+  void (*func)(void *);
+  void *userData;
+} AsyncCall;
+
+static void
+async_call_free(AsyncCall *asyncCall)
+{
+  npw_plugin_instance_unref(asyncCall->plugin);
+  free(asyncCall);
+}
+
+static gboolean
+async_call_run(gpointer data)
+{
+  AsyncCall *asyncCall = data;
+  if (npw_plugin_instance_is_valid(asyncCall->plugin))
+	asyncCall->func(asyncCall->userData);
+  return FALSE;
+}
+
+static void
+g_NPN_PluginThreadAsyncCall(NPP instance,
+							void (*func)(void *),
+							void *userData)
+{
+  if (instance == NULL)
+	return;
+  // It's the plugin's responsibility to ensure the NPP remains valid
+  // while the function is called.
+  PluginInstance *plugin = PLUGIN_INSTANCE(instance);
+  if (plugin == NULL)
+	return;
+
+  // No debug statements as the debug system is not thread-safe.
+  AsyncCall *asyncCall = malloc(sizeof(AsyncCall));
+  asyncCall->plugin = npw_plugin_instance_ref(plugin);
+  asyncCall->func = func;
+  asyncCall->userData = userData;
+  g_idle_add_full(G_PRIORITY_DEFAULT_IDLE,
+				  async_call_run, asyncCall, (GDestroyNotify) async_call_free);
+}
+
+// Queries information about a URL
+static NPError
+invoke_NPN_GetValueForURL(PluginInstance *plugin, NPNURLVariable variable,
+						  const char *url, char **value, uint32_t *len)
+{
+  npw_return_val_if_fail(rpc_method_invoke_possible(g_rpc_connection),
+						 NPERR_GENERIC_ERROR);
+
+  int error = rpc_method_invoke(g_rpc_connection,
+								RPC_METHOD_NPN_GET_VALUE_FOR_URL,
+								RPC_TYPE_NPW_PLUGIN_INSTANCE, plugin,
+								RPC_TYPE_UINT32, variable,
+								RPC_TYPE_STRING, url,
+								RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_GetValueForURL() invoke", error);
+	return NPERR_GENERIC_ERROR;
+  }
+
+  int32_t ret;
+  uint32_t myLen;
+  char *myValue;
+  error = rpc_method_wait_for_reply(g_rpc_connection,
+									RPC_TYPE_INT32, &ret,
+									RPC_TYPE_ARRAY, RPC_TYPE_CHAR, &myLen, &myValue,
+									RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_GetValueForURL() wait for reply", error);
+	return NPERR_GENERIC_ERROR;
+  }
+
+  // Reallocate with NPN_MemAlloc because the RPC system wasn't clever
+  // enough to.
+  *len = myLen;
+  if (ret == NPERR_NO_ERROR) {
+	ret = NPW_ReallocData(myValue, myLen, (void**)value);
+  }
+
+  if (myValue)
+	free(myValue);
+
+  return ret;
+}
+
+static NPError
+g_NPN_GetValueForURL(NPP instance, NPNURLVariable variable,
+					 const char *url, char **value, uint32_t *len)
+{
+  if (!thread_check()) {
+	npw_printf("WARNING: NPN_GetValueForURL not called from the main thread\n");
+	return NPERR_INVALID_INSTANCE_ERROR;
+  }
+
+  if (instance == NULL)
+	return NPERR_INVALID_INSTANCE_ERROR;
+
+  PluginInstance *plugin = PLUGIN_INSTANCE(instance);
+  if (plugin == NULL)
+	return NPERR_INVALID_INSTANCE_ERROR;
+
+  D(bugiI("NPN_GetValueForURL instance=%p, variable=%d [%s], url=%s\n",
+		  instance, variable, string_of_NPNURLVariable(variable), url));
+  npw_plugin_instance_ref(plugin);
+  NPError ret = invoke_NPN_GetValueForURL(plugin, variable, url, value, len);
+  npw_plugin_instance_unref(plugin);
+  D(bugiD("NPN_GetValueForURL return: %d [%s] len=%d\n",
+		  ret, string_of_NPError(ret), *len));
+  return ret;
+}
+
+// Sets information about a URL
+static NPError
+invoke_NPN_SetValueForURL(PluginInstance *plugin, NPNURLVariable variable,
+						  const char *url, const char *value, uint32_t len)
+{
+  npw_return_val_if_fail(rpc_method_invoke_possible(g_rpc_connection),
+						 NPERR_GENERIC_ERROR);
+
+  int error = rpc_method_invoke(g_rpc_connection,
+								RPC_METHOD_NPN_SET_VALUE_FOR_URL,
+								RPC_TYPE_NPW_PLUGIN_INSTANCE, plugin,
+								RPC_TYPE_UINT32, variable,
+								RPC_TYPE_STRING, url,
+								RPC_TYPE_ARRAY, RPC_TYPE_CHAR, len, value,
+								RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_SetValueForURL() invoke", error);
+	return NPERR_GENERIC_ERROR;
+  }
+
+  int32_t ret;
+  error = rpc_method_wait_for_reply(g_rpc_connection,
+									RPC_TYPE_INT32, &ret,
+									RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_SetValueForURL() wait for reply", error);
+	return NPERR_GENERIC_ERROR;
+  }
+
+  return ret;
+}
+
+static NPError
+g_NPN_SetValueForURL(NPP instance, NPNURLVariable variable,
+					 const char *url, const char *value, uint32_t len)
+{
+  if (!thread_check()) {
+	npw_printf("WARNING: NPN_SetValueForURL not called from the main thread\n");
+	return NPERR_INVALID_INSTANCE_ERROR;
+  }
+
+  if (instance == NULL)
+	return NPERR_INVALID_INSTANCE_ERROR;
+
+  PluginInstance *plugin = PLUGIN_INSTANCE(instance);
+  if (plugin == NULL)
+	return NPERR_INVALID_INSTANCE_ERROR;
+
+  D(bugiI("NPN_SetValueForURL instance=%p, variable=%d [%s], url=%s, len=%d\n",
+		  instance, variable, string_of_NPNURLVariable(variable), url, len));
+  npw_plugin_instance_ref(plugin);
+  NPError ret = invoke_NPN_SetValueForURL(plugin, variable, url, value, len);
+  npw_plugin_instance_unref(plugin);
+  D(bugiD("NPN_SetValueForURL return: %d [%s]\n", ret, string_of_NPError(ret)));
+  return ret;
+}
+
+
+// Queries authentication information for a URL
+static NPError
+invoke_NPN_GetAuthenticationInfo(PluginInstance *plugin, const char *protocol,
+								 const char *host, int32_t port,
+								 const char *scheme, const char *realm,
+								 char **username, uint32_t *ulen,
+								 char **password, uint32_t *plen)
+{
+  npw_return_val_if_fail(rpc_method_invoke_possible(g_rpc_connection),
+						 NPERR_GENERIC_ERROR);
+
+  int error = rpc_method_invoke(g_rpc_connection,
+								RPC_METHOD_NPN_GET_AUTHENTICATION_INFO,
+								RPC_TYPE_NPW_PLUGIN_INSTANCE, plugin,
+								RPC_TYPE_STRING, protocol,
+								RPC_TYPE_STRING, host,
+								RPC_TYPE_INT32, port,
+								RPC_TYPE_STRING, scheme,
+								RPC_TYPE_STRING, realm,
+								RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_GetAuthenticationInfo() invoke", error);
+	return NPERR_GENERIC_ERROR;
+  }
+
+  int32_t ret;
+  char *myUsername, *myPassword;
+  error = rpc_method_wait_for_reply(g_rpc_connection,
+									RPC_TYPE_INT32, &ret,
+									RPC_TYPE_ARRAY, RPC_TYPE_CHAR, ulen, &myUsername,
+									RPC_TYPE_ARRAY, RPC_TYPE_CHAR, plen, &myPassword,
+									RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_GetValueForURL() wait for reply", error);
+	return NPERR_GENERIC_ERROR;
+  }
+
+  // Reallocate with NPN_MemAlloc because the RPC system wasn't clever
+  // enough to.
+  if (ret == NPERR_NO_ERROR) {
+	ret = NPW_ReallocData(myUsername, *ulen, (void**)username);
+	if (ret == NPERR_NO_ERROR) {
+	  ret = NPW_ReallocData(myPassword, *ulen, (void**)password);
+	  if (ret == NPERR_OUT_OF_MEMORY_ERROR && *username)
+		NPN_MemFree(*username);
+	}
+  }
+
+  if (myUsername)
+	free(myUsername);
+  if (myPassword)
+	free(myPassword);
+
+  return ret;
+}
+
+static NPError
+g_NPN_GetAuthenticationInfo(NPP instance, const char *protocol,
+							const char *host, int32_t port, const char *scheme,
+							const char *realm,
+							char **username, uint32_t *ulen,
+							char **password, uint32_t *plen)
+{
+  if (!thread_check()) {
+	npw_printf("WARNING: NPN_GetAuthenticationInfo not called from the main thread\n");
+	return NPERR_INVALID_INSTANCE_ERROR;
+  }
+
+  if (instance == NULL)
+	return NPERR_INVALID_INSTANCE_ERROR;
+
+  PluginInstance *plugin = PLUGIN_INSTANCE(instance);
+  if (plugin == NULL)
+	return NPERR_INVALID_INSTANCE_ERROR;
+
+  D(bugiI("NPN_GetAuthenticationInfo instance=%p, protocol=%s,"
+		  " host=%s, port=%d, scheme=%s, realm=%s\n",
+		  instance, protocol, host, port, scheme, realm));
+  npw_plugin_instance_ref(plugin);
+  NPError ret = invoke_NPN_GetAuthenticationInfo(plugin, protocol, host,
+												 port, scheme, realm,
+												 username, ulen,
+												 password, plen);
+  npw_plugin_instance_unref(plugin);
+  D(bugiD("NPN_GetAuthenticationInfo return: %d [%s] ulen=%d, plen=%d\n",
+		  ret, string_of_NPError(ret), *ulen, *plen));
+  return ret;
+}
+
+typedef struct _TimerData {
+  uint32_t timer_id;
+  PluginInstance *plugin;
+} TimerData;
+
+static gboolean
+timer_data_run(TimerData *data)
+{
+  // Check if the timer is even valid anymore.
+  if (!npw_plugin_instance_is_valid(data->plugin))
+	return FALSE;
+  Timer *timer = g_hash_table_lookup(data->plugin->timers,
+									 GINT_TO_POINTER(data->timer_id));
+  if (timer == NULL)
+	return FALSE;
+
+  timer->func(PLUGIN_INSTANCE_NPP(data->plugin), data->timer_id);
+
+  if (!timer->repeat) {
+	// Don't bother trying to detach it later.
+	timer->source_id = 0;
+	return FALSE;
+  }
+  return TRUE;
+}
+
+static void
+timer_data_free(TimerData *data)
+{
+  npw_plugin_instance_unref(data->plugin);
+  g_free(data);
+}
+
+static void
+timer_free(Timer *timer)
+{
+  if (timer->source_id) {
+	g_source_remove(timer->source_id);
+	timer->source_id = 0;
+  }
+  g_free(timer);
+}
+
+static uint32_t
+g_NPN_ScheduleTimer(NPP instance, uint32_t interval, NPBool repeat,
+					void (*timerFunc)(NPP npp, uint32_t timerID))
+{
+  if (!thread_check()) {
+	npw_printf("WARNING: NPN_ScheduleTimer not called from the main thread\n");
+	return NPERR_INVALID_INSTANCE_ERROR;
+  }
+
+  if (instance == NULL)
+	return NPERR_INVALID_INSTANCE_ERROR;
+
+  PluginInstance *plugin = PLUGIN_INSTANCE(instance);
+  if (plugin == NULL)
+	return NPERR_INVALID_INSTANCE_ERROR;
+
+  D(bugiI("NPN_ScheduleTimer instance=%p, interval=%d, repeat=%d\n",
+		  instance, interval, repeat));
+
+  uint32_t timer_id = plugin->next_timer_id++;
+
+  Timer *timer = g_new0(Timer, 1);
+  timer->repeat = repeat;
+  timer->func = timerFunc;
+  g_hash_table_insert(plugin->timers, GINT_TO_POINTER(timer_id), timer);
+
+  TimerData *timer_data = g_new0(TimerData, 1);
+  timer_data->timer_id = timer_id;
+  timer_data->plugin = npw_plugin_instance_ref(plugin);
+
+  timer->source_id = g_timeout_add_full(G_PRIORITY_DEFAULT,
+										interval,
+										(GSourceFunc) timer_data_run,
+										timer_data,
+										(GDestroyNotify) timer_data_free);
+
+  D(bugiD("NPN_ScheduleTimer return: %d\n", timer_id));
+
+  return timer_id;
+}
+
+static void
+g_NPN_UnscheduleTimer(NPP instance, uint32_t timerID)
+{
+  if (!thread_check()) {
+	npw_printf("WARNING: NPN_UnscheduleTimer not called from the main thread\n");
+	return;
+  }
+
+  if (instance == NULL)
+	return;
+
+  PluginInstance *plugin = PLUGIN_INSTANCE(instance);
+  if (plugin == NULL)
+	return;
+
+  D(bugiI("NPN_UnscheduleTimer instance=%p, timerID=%d\n", instance, timerID));
+  g_hash_table_remove(plugin->timers, GINT_TO_POINTER(timerID));
+  D(bugiD("NPN_UnscheduleTimer done\n"));
+}
+
 
 /* ====================================================================== */
 /* === Plug-in side data                                              === */
@@ -3118,20 +3476,16 @@ g_NPN_IntFromIdentifier(NPIdentifier identifier)
 static NPPluginFuncs plugin_funcs;
 
 // Allows the browser to query the plug-in supported formats
-typedef char * (*NP_GetMIMEDescriptionUPP)(void);
-static NP_GetMIMEDescriptionUPP g_plugin_NP_GetMIMEDescription = NULL;
+static NP_GetMIMEDescriptionFunc g_plugin_NP_GetMIMEDescription = NULL;
 
 // Allows the browser to query the plug-in for information
-typedef NPError (*NP_GetValueUPP)(void *instance, NPPVariable variable, void *value);
-static NP_GetValueUPP g_plugin_NP_GetValue = NULL;
+static NP_GetValueFunc g_plugin_NP_GetValue = NULL;
 
 // Provides global initialization for a plug-in
-typedef NPError (*NP_InitializeUPP)(NPNetscapeFuncs *moz_funcs, NPPluginFuncs *plugin_funcs);
-static NP_InitializeUPP g_plugin_NP_Initialize = NULL;
+static NP_InitializeFunc g_plugin_NP_Initialize = NULL;
 
 // Provides global deinitialization for a plug-in
-typedef NPError (*NP_ShutdownUPP)(void);
-static NP_ShutdownUPP g_plugin_NP_Shutdown = NULL;
+static NP_ShutdownFunc g_plugin_NP_Shutdown = NULL;
 
 
 /* ====================================================================== */
@@ -3139,14 +3493,14 @@ static NP_ShutdownUPP g_plugin_NP_Shutdown = NULL;
 /* ====================================================================== */
 
 // NP_GetMIMEDescription
-static char *
+static const char *
 g_NP_GetMIMEDescription(void)
 {
   if (g_plugin_NP_GetMIMEDescription == NULL)
 	return NULL;
 
   D(bugiI("NP_GetMIMEDescription\n"));
-  char *str = g_plugin_NP_GetMIMEDescription();
+  const char *str = g_plugin_NP_GetMIMEDescription();
   D(bugiD("NP_GetMIMEDescription return: %s\n", str ? str : "<empty>"));
   return str;
 }
@@ -3161,7 +3515,7 @@ static int handle_NP_GetMIMEDescription(rpc_connection_t *connection)
 	return error;
   }
 
-  char *str = g_NP_GetMIMEDescription();
+  const char *str = g_NP_GetMIMEDescription();
   return rpc_method_send_reply(connection, RPC_TYPE_STRING, str, RPC_TYPE_INVALID);
 }
 
@@ -3207,7 +3561,7 @@ static int handle_NP_GetValue(rpc_connection_t *connection)
 	}
   case RPC_TYPE_BOOLEAN:
 	{
-	  PRBool b = PR_FALSE;
+	  NPBool b = FALSE;
 	  ret = g_NP_GetValue(variable, (void *)&b);
 	  return rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_BOOLEAN, b, RPC_TYPE_INVALID);
 	}
@@ -3219,74 +3573,73 @@ static int handle_NP_GetValue(rpc_connection_t *connection)
 
 // NP_Initialize
 static NPError
-g_NP_Initialize(uint32_t version)
+g_NP_Initialize(uint32_t version, uint32_t *plugin_version,
+				uint32_t *browser_capabilities, uint32_t browser_capabilities_len,
+				uint32_t *plugin_capabilities, uint32_t plugin_capabilities_len)
 {
   if (g_plugin_NP_Initialize == NULL)
 	return NPERR_INVALID_FUNCTABLE_ERROR;
 
   memset(&plugin_funcs, 0, sizeof(plugin_funcs));
   plugin_funcs.size = sizeof(plugin_funcs);
+  plugin_funcs.version = version;
 
   memset(&mozilla_funcs, 0, sizeof(mozilla_funcs));
   mozilla_funcs.size = sizeof(mozilla_funcs);
   mozilla_funcs.version = version;
-  mozilla_funcs.geturl = NewNPN_GetURLProc(g_NPN_GetURL);
-  mozilla_funcs.posturl = NewNPN_PostURLProc(g_NPN_PostURL);
-  mozilla_funcs.requestread = NewNPN_RequestReadProc(g_NPN_RequestRead);
-  mozilla_funcs.newstream = NewNPN_NewStreamProc(g_NPN_NewStream);
-  mozilla_funcs.write = NewNPN_WriteProc(g_NPN_Write);
-  mozilla_funcs.destroystream = NewNPN_DestroyStreamProc(g_NPN_DestroyStream);
-  mozilla_funcs.status = NewNPN_StatusProc(g_NPN_Status);
-  mozilla_funcs.uagent = NewNPN_UserAgentProc(g_NPN_UserAgent);
-  mozilla_funcs.memalloc = NewNPN_MemAllocProc(g_NPN_MemAlloc);
-  mozilla_funcs.memfree = NewNPN_MemFreeProc(g_NPN_MemFree);
-  mozilla_funcs.memflush = NewNPN_MemFlushProc(g_NPN_MemFlush);
-  mozilla_funcs.reloadplugins = NewNPN_ReloadPluginsProc(g_NPN_ReloadPlugins);
-  mozilla_funcs.getJavaEnv = NewNPN_GetJavaEnvProc(g_NPN_GetJavaEnv);
-  mozilla_funcs.getJavaPeer = NewNPN_GetJavaPeerProc(g_NPN_GetJavaPeer);
-  mozilla_funcs.geturlnotify = NewNPN_GetURLNotifyProc(g_NPN_GetURLNotify);
-  mozilla_funcs.posturlnotify = NewNPN_PostURLNotifyProc(g_NPN_PostURLNotify);
-  mozilla_funcs.getvalue = NewNPN_GetValueProc(g_NPN_GetValue);
-  mozilla_funcs.setvalue = NewNPN_SetValueProc(g_NPN_SetValue);
-  mozilla_funcs.invalidaterect = NewNPN_InvalidateRectProc(g_NPN_InvalidateRect);
-  mozilla_funcs.invalidateregion = NewNPN_InvalidateRegionProc(g_NPN_InvalidateRegion);
-  mozilla_funcs.forceredraw = NewNPN_ForceRedrawProc(g_NPN_ForceRedraw);
-  mozilla_funcs.pushpopupsenabledstate = NewNPN_PushPopupsEnabledStateProc(g_NPN_PushPopupsEnabledState);
-  mozilla_funcs.poppopupsenabledstate = NewNPN_PopPopupsEnabledStateProc(g_NPN_PopPopupsEnabledState);
+
+  int num = 0;
+#define BROWSER_FUNC(func, member)										\
+  if (num >= browser_capabilities_len) {								\
+	npw_printf("ERROR: capabilities length mismatch at %d: got %d\n",	\
+			   num, browser_capabilities_len);							\
+	goto browser_func_done;												\
+  }																		\
+  if (!browser_capabilities[num])										\
+	D(bug("browser does not provide " #func "\n"));						\
+  else																	\
+	mozilla_funcs.member = g_ ## func;									\
+  num++;
+#include "browser-funcs.h"
+#undef BROWSER_FUNC
+ browser_func_done:
+
+  // Unconditionally provide NPN_PluginThreadAsyncCall and the timer
+  // functions. They require no browser support.
+  mozilla_funcs.pluginthreadasynccall = g_NPN_PluginThreadAsyncCall;
+  mozilla_funcs.scheduletimer = g_NPN_ScheduleTimer;
+  mozilla_funcs.unscheduletimer = g_NPN_UnscheduleTimer;
+
+  if (!npobject_bridge_new())
+	return NPERR_OUT_OF_MEMORY_ERROR;
 
   if (NPN_HAS_FEATURE(NPRUNTIME_SCRIPTING)) {
 	D(bug(" browser supports scripting through npruntime\n"));
-	mozilla_funcs.getstringidentifier = NewNPN_GetStringIdentifierProc(g_NPN_GetStringIdentifier);
-	mozilla_funcs.getstringidentifiers = NewNPN_GetStringIdentifiersProc(g_NPN_GetStringIdentifiers);
-	mozilla_funcs.getintidentifier = NewNPN_GetIntIdentifierProc(g_NPN_GetIntIdentifier);
-	mozilla_funcs.identifierisstring = NewNPN_IdentifierIsStringProc(g_NPN_IdentifierIsString);
-	mozilla_funcs.utf8fromidentifier = NewNPN_UTF8FromIdentifierProc(g_NPN_UTF8FromIdentifier);
-	mozilla_funcs.intfromidentifier = NewNPN_IntFromIdentifierProc(g_NPN_IntFromIdentifier);
-	mozilla_funcs.createobject = NewNPN_CreateObjectProc(g_NPN_CreateObject);
-	mozilla_funcs.retainobject = NewNPN_RetainObjectProc(g_NPN_RetainObject);
-	mozilla_funcs.releaseobject = NewNPN_ReleaseObjectProc(g_NPN_ReleaseObject);
-	mozilla_funcs.invoke = NewNPN_InvokeProc(g_NPN_Invoke);
-	mozilla_funcs.invokeDefault = NewNPN_InvokeDefaultProc(g_NPN_InvokeDefault);
-	mozilla_funcs.evaluate = NewNPN_EvaluateProc(g_NPN_Evaluate);
-	mozilla_funcs.getproperty = NewNPN_GetPropertyProc(g_NPN_GetProperty);
-	mozilla_funcs.setproperty = NewNPN_SetPropertyProc(g_NPN_SetProperty);
-	mozilla_funcs.removeproperty = NewNPN_RemovePropertyProc(g_NPN_RemoveProperty);
-	mozilla_funcs.hasproperty = NewNPN_HasPropertyProc(g_NPN_HasProperty);
-	mozilla_funcs.hasmethod = NewNPN_HasMethodProc(g_NPN_HasMethod);
-	mozilla_funcs.releasevariantvalue = NewNPN_ReleaseVariantValueProc(g_NPN_ReleaseVariantValue);
-	mozilla_funcs.setexception = NewNPN_SetExceptionProc(g_NPN_SetException);
-
-	if (!npobject_bridge_new())
-	  return NPERR_OUT_OF_MEMORY_ERROR;
   }
 
   // Initialize function tables
   // XXX: remove the local copies from this file
   NPW_InitializeFuncs(&mozilla_funcs, &plugin_funcs);
 
-  D(bugiI("NP_Initialize\n"));
+  D(bugiI("NP_Initialize version=%d\n", version));
   NPError ret = g_plugin_NP_Initialize(&mozilla_funcs, &plugin_funcs);
-  D(bugiD("NP_Initialize return: %d\n", ret));
+  *plugin_version = plugin_funcs.version;
+
+  if (plugin_capabilities) {
+	int num = 0;
+#define PLUGIN_FUNC(func, member)								\
+	if (num >= plugin_capabilities_len)	{						\
+	  D(bug("ERROR: provided array was too small.\n"));			\
+	  goto plugin_func_done;									\
+	}															\
+	plugin_capabilities[num] = (plugin_funcs.member != NULL);	\
+	num++;
+#include "plugin-funcs.h"
+#undef PLUGIN_FUNC
+  }
+ plugin_func_done:
+
+  D(bugiD("NP_Initialize return: %d, plugin_version=%d\n", ret, *plugin_version));
   return ret;
 }
 
@@ -3295,8 +3648,12 @@ static int handle_NP_Initialize(rpc_connection_t *connection)
   D(bug("handle_NP_Initialize\n"));
 
   uint32_t version;
+  uint32_t *browser_capabilities;
+  uint32_t browser_capabilities_len;
   int error = rpc_method_get_args(connection,
 								  RPC_TYPE_UINT32, &version,
+								  RPC_TYPE_ARRAY, RPC_TYPE_UINT32,
+								  &browser_capabilities_len, &browser_capabilities,
 								  RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
@@ -3304,8 +3661,28 @@ static int handle_NP_Initialize(rpc_connection_t *connection)
 	return error;
   }
 
-  NPError ret = g_NP_Initialize(version);
-  return rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_INVALID);
+  uint32_t plugin_version = 0;
+  uint32_t plugin_capabilities[0
+#define PLUGIN_FUNC(func, member)				\
+							   + 1
+#include "plugin-funcs.h"
+#undef PLUGIN_FUNC
+							   ];
+  NPError ret = g_NP_Initialize(version, &plugin_version,
+								browser_capabilities, browser_capabilities_len,
+								plugin_capabilities,
+								G_N_ELEMENTS(plugin_capabilities));
+
+  if (browser_capabilities)
+	free(browser_capabilities);
+
+  return rpc_method_send_reply(connection,
+                               RPC_TYPE_INT32, ret,
+                               RPC_TYPE_UINT32, plugin_version,
+							   RPC_TYPE_ARRAY, RPC_TYPE_UINT32,
+							   G_N_ELEMENTS(plugin_capabilities),
+							   plugin_capabilities,
+                               RPC_TYPE_INVALID);
 }
 
 // NP_Shutdown
@@ -3319,10 +3696,9 @@ g_NP_Shutdown(void)
   NPError ret = g_plugin_NP_Shutdown();
   D(bugiD("NP_Shutdown done\n"));
 
-  if (NPN_HAS_FEATURE(NPRUNTIME_SCRIPTING))
-	npobject_bridge_destroy();
+  npobject_bridge_destroy();
 
-  gtk_main_quit();
+  g_is_running = false;
 
   return ret;
 }
@@ -3378,11 +3754,14 @@ static NPError g_NPP_New(NPMIMEType plugin_type, uint32_t instance_id,
   D(bugiD("NPP_New return: %d [%s]\n", ret, string_of_NPError(ret)));
 
   // check if XEMBED is to be used
-  PRBool supports_XEmbed = PR_FALSE;
+  long supports_XEmbed = FALSE;
   if (mozilla_funcs.getvalue) {
+	// Even though NPAPI kindly provides an NPBool typedef,
+	// NPNVSupportsXEmbedBool is documented to be a 4-byte PRBool. And
+	// Flash treats it as such.
 	NPError error = mozilla_funcs.getvalue(NULL, NPNVSupportsXEmbedBool, (void *)&supports_XEmbed);
 	if (error == NPERR_NO_ERROR && plugin_funcs.getvalue) {
-	  PRBool needs_XEmbed = PR_FALSE;
+	  long needs_XEmbed = FALSE;
 	  error = plugin_funcs.getvalue(instance, NPPVpluginNeedsXEmbed, (void *)&needs_XEmbed);
 	  if (error == NPERR_NO_ERROR)
 		plugin->use_xembed = supports_XEmbed && needs_XEmbed;
@@ -3394,6 +3773,11 @@ static NPError g_NPP_New(NPMIMEType plugin_type, uint32_t instance_id,
 	if (xt_source_create() < 0)
 	  return NPERR_GENERIC_ERROR;
   }
+
+  plugin->next_timer_id = 1;
+  plugin->timers = g_hash_table_new_full(NULL, NULL, NULL,
+										 (GDestroyNotify) timer_free);
+  plugin->npobjects = g_hash_table_new(NULL, NULL);
 
   return ret;
 }
@@ -3439,8 +3823,23 @@ static int handle_NPP_New(rpc_connection_t *connection)
 	  free(argv[i]);
 	free(argv);
   }
+  if (saved) {
+    if (saved->buf)
+      NPN_MemFree(saved->buf);
+    NPN_MemFree(saved);
+  }
 
   return rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_INVALID);
+}
+
+static void invalidate_npobject(gpointer key, gpointer value, gpointer user_data)
+{
+  NPObject *npobj = key;
+  D(bugiI("invalidate_npobject %p\n", npobj));
+  if (npobj->_class && npobj->_class->invalidate)
+	npobj->_class->invalidate(npobj);
+  npobject_unregister(npobj);
+  D(bugiD("invalidate_npobject done\n"));
 }
 
 // NPP_Destroy
@@ -3456,13 +3855,16 @@ static NPError g_NPP_Destroy(NPP instance, NPSavedData **sdata)
   if (sdata)
 	*sdata = NULL;
 
-  // Process all pending calls as the data could become junk afterwards
-  // XXX: this also processes delayed calls from other instances
-  delayed_calls_process(plugin, TRUE);
-
   D(bugiI("NPP_Destroy instance=%p\n", instance));
   NPError ret = plugin_funcs.destroy(instance, sdata);
   D(bugiD("NPP_Destroy return: %d [%s]\n", ret, string_of_NPError(ret)));
+
+  // Invalidate all NPObjects remaining. We won't forcibly delete them
+  // like Firefox does because there may be proxies and stubs still
+  // holding on. The references should eventually go away and allow us
+  // to free it. If needbe we can track more objects, but anything
+  // left here is arguably a plugin or browser bug.
+  g_hash_table_foreach(plugin->npobjects, invalidate_npobject, NULL);
 
   if (!plugin->use_xembed)
 	xt_source_destroy();
@@ -3494,6 +3896,11 @@ static int handle_NPP_Destroy(rpc_connection_t *connection)
 								RPC_TYPE_INT32, ret,
 								RPC_TYPE_NP_SAVED_DATA, save_area,
 								RPC_TYPE_INVALID);
+  if (save_area) {
+    if (save_area->buf)
+      NPN_MemFree(save_area->buf);
+    NPN_MemFree(save_area);
+  }
 
   rpc_connection_unref(connection);
   return error;
@@ -3528,7 +3935,9 @@ g_NPP_SetWindow(NPP instance, NPWindow *np_window)
 	window = &plugin->window;
   }
 
-  D(bugiI("NPP_SetWindow instance=%p, window=%p\n", instance, window ? window->window : NULL));
+  D(bugiI("NPP_SetWindow instance=%p, window=%p [%s]\n",
+		  instance, window ? window->window : NULL,
+		  window ? string_of_NPWindowType(window->type) : "<null>"));
   NPError ret = plugin_funcs.setwindow(instance, window);
   D(bugiD("NPP_SetWindow return: %d [%s]\n", ret, string_of_NPError(ret)));
 
@@ -3611,7 +4020,11 @@ static int handle_NPP_GetValue(rpc_connection_t *connection)
 	{
 	  char *str = NULL;
 	  ret = g_NPP_GetValue(PLUGIN_INSTANCE_NPP(plugin), variable, (void *)&str);
-	  return rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_STRING, str, RPC_TYPE_INVALID);
+	  error = rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_STRING, str, RPC_TYPE_INVALID);
+	  // Eww. NPPVformValue needs to be freed, but not the others.
+	  if (variable == NPPVformValue && str != NULL)
+		NPN_MemFree(str);
+	  return error;
 	}
   case RPC_TYPE_INT32:
 	{
@@ -3621,7 +4034,7 @@ static int handle_NPP_GetValue(rpc_connection_t *connection)
 	}
   case RPC_TYPE_BOOLEAN:
 	{
-	  PRBool b = PR_FALSE;
+	  NPBool b = FALSE;
 	  ret = g_NPP_GetValue(PLUGIN_INSTANCE_NPP(plugin), variable, (void *)&b);
 	  return rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_BOOLEAN, b, RPC_TYPE_INVALID);
 	}
@@ -3629,7 +4042,10 @@ static int handle_NPP_GetValue(rpc_connection_t *connection)
 	{
 	  NPObject *npobj = NULL;
 	  ret = g_NPP_GetValue(PLUGIN_INSTANCE_NPP(plugin), variable, (void *)&npobj);
-	  return rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_NP_OBJECT, npobj, RPC_TYPE_INVALID);
+	  return rpc_method_send_reply(connection,
+								   RPC_TYPE_INT32, ret,
+								   RPC_TYPE_NP_OBJECT_PASS_REF, npobj,
+								   RPC_TYPE_INVALID);
 	}
   }
 
@@ -3684,7 +4100,7 @@ static int handle_NPP_URLNotify(rpc_connection_t *connection)
 
 // NPP_NewStream
 static NPError
-g_NPP_NewStream(NPP instance, NPMIMEType type, NPStream *stream, NPBool seekable, uint16 *stype)
+g_NPP_NewStream(NPP instance, NPMIMEType type, NPStream *stream, NPBool seekable, uint16_t *stype)
 {
   if (instance == NULL)
 	return NPERR_INVALID_INSTANCE_ERROR;
@@ -3741,7 +4157,7 @@ static int handle_NPP_NewStream(rpc_connection_t *connection)
   stream_ndata->stream = stream;
   stream_ndata->is_plugin_stream = 0;
 
-  uint16 stype = NP_NORMAL;
+  uint16_t stype = NP_NORMAL;
   NPError ret = g_NPP_NewStream(PLUGIN_INSTANCE_NPP(plugin), type, stream, seekable, &stype);
 
   if (type)
@@ -3807,7 +4223,7 @@ static int handle_NPP_DestroyStream(rpc_connection_t *connection)
 }
 
 // NPP_WriteReady
-static int32
+static int32_t
 g_NPP_WriteReady(NPP instance, NPStream *stream)
 {
   if (instance == NULL)
@@ -3820,7 +4236,7 @@ g_NPP_WriteReady(NPP instance, NPStream *stream)
 	return 0;
 
   D(bugiI("NPP_WriteReady instance=%p, stream=%p\n", instance, stream));
-  int32 ret = plugin_funcs.writeready(instance, stream);
+  int32_t ret = plugin_funcs.writeready(instance, stream);
   D(bugiD("NPP_WriteReady return: %d\n", ret));
   return ret;
 }
@@ -3841,14 +4257,14 @@ static int handle_NPP_WriteReady(rpc_connection_t *connection)
 	return error;
   }
 
-  int32 ret = g_NPP_WriteReady(PLUGIN_INSTANCE_NPP(plugin), stream);
+  int32_t ret = g_NPP_WriteReady(PLUGIN_INSTANCE_NPP(plugin), stream);
 
   return rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_INVALID);
 }
 
 // NPP_Write
-static int32
-g_NPP_Write(NPP instance, NPStream *stream, int32 offset, int32 len, void *buf)
+static int32_t
+g_NPP_Write(NPP instance, NPStream *stream, int32_t offset, int32_t len, void *buf)
 {
   if (instance == NULL)
 	return -1;
@@ -3860,7 +4276,7 @@ g_NPP_Write(NPP instance, NPStream *stream, int32 offset, int32 len, void *buf)
 	return -1;
 
   D(bugiI("NPP_Write instance=%p, stream=%p, offset=%d, len=%d, buf=%p\n", instance, stream, offset, len, buf));
-  int32 ret = plugin_funcs.write(instance, stream, offset, len, buf);
+  int32_t ret = plugin_funcs.write(instance, stream, offset, len, buf);
   D(bugiD("NPP_Write return: %d\n", ret));
   return ret;
 }
@@ -3885,7 +4301,7 @@ static int handle_NPP_Write(rpc_connection_t *connection)
 	return error;
   }
 
-  int32 ret = g_NPP_Write(PLUGIN_INSTANCE_NPP(plugin), stream, offset, len, buf);
+  int32_t ret = g_NPP_Write(PLUGIN_INSTANCE_NPP(plugin), stream, offset, len, buf);
 
   if (buf)
 	free(buf);
@@ -4018,7 +4434,7 @@ static int handle_NPP_Print(rpc_connection_t *connection)
   // send back the printed data
   if (printer.fp) {
 	long file_size = ftell(printer.fp);
-	D(bug(" writeback data [%d bytes]\n", file_size));
+	D(bug(" writeback data [%ld bytes]\n", file_size));
 	rewind(printer.fp);
 	if (file_size > 0) {
 	  NPPrintData printData;
@@ -4059,7 +4475,7 @@ static int handle_NPP_Print(rpc_connection_t *connection)
 }
 
 // Delivers a platform-specific window event to the instance
-static int16
+static int16_t
 g_NPP_HandleEvent(NPP instance, NPEvent *event)
 {
   if (instance == NULL)
@@ -4072,7 +4488,7 @@ g_NPP_HandleEvent(NPP instance, NPEvent *event)
 	return false;
 
   D(bugiI("NPP_HandleEvent instance=%p, event=%p [%s]\n", instance, event, string_of_NPEvent_type(event->type)));
-  int16 ret = plugin_funcs.event(instance, event);
+  int16_t ret = plugin_funcs.event(instance, event);
   D(bugiD("NPP_HandleEvent return: %d\n", ret));
 
   /* XXX: let's have a chance to commit the pixmap before it's gone */
@@ -4099,9 +4515,90 @@ static int handle_NPP_HandleEvent(rpc_connection_t *connection)
   }
 
   event.xany.display = x_display;
-  int16 ret = g_NPP_HandleEvent(PLUGIN_INSTANCE_NPP(plugin), &event);
+  int16_t ret = g_NPP_HandleEvent(PLUGIN_INSTANCE_NPP(plugin), &event);
 
   return rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_INVALID);
+}
+
+// Clears site-data stored by the plug-in
+static NPError
+g_NPP_ClearSiteData(const char* site, uint64_t flags, uint64_t maxAge)
+{
+  if (plugin_funcs.clearsitedata == NULL)
+	return NPERR_INVALID_FUNCTABLE_ERROR;
+
+  D(bugiI("NPP_ClearSiteData site=%s, flags=%" G_GUINT64_FORMAT
+		  ", maxAge=%" G_GUINT64_FORMAT "\n",
+		  site ? site : "<null>", flags, maxAge));
+  NPError ret = plugin_funcs.clearsitedata(site, flags, maxAge);
+  D(bugiD("NPP_ClearSiteData return: %d [%s]\n", ret, string_of_NPError(ret)));
+  return ret;
+}
+
+static int handle_NPP_ClearSiteData(rpc_connection_t *connection)
+{
+  D(bug("handle_NPP_ClearSiteData\n"));
+
+  char *site = NULL;
+  uint64_t flags;
+  uint64_t maxAge;
+  int error = rpc_method_get_args(connection,
+								  RPC_TYPE_STRING, &site,
+								  RPC_TYPE_UINT64, &flags,
+								  RPC_TYPE_UINT64, &maxAge,
+								  RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPP_ClearSiteData() get args", error);
+	return error;
+  }
+
+  NPError ret = g_NPP_ClearSiteData(site, flags, maxAge);
+
+  if (site)
+	free(site);
+
+  return rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_INVALID);
+}
+
+// Get sites with data stored by the plug-in
+static char **
+g_NPP_GetSitesWithData(void)
+{
+  if (plugin_funcs.getsiteswithdata == NULL)
+	return NULL;
+
+  D(bugiI("NPP_GetSitesWithData\n"));
+  char **ret = plugin_funcs.getsiteswithdata();
+  D(bugiD("NPP_GetSitesWithData return: %d sites\n",
+		  ret ? g_strv_length(ret) : 0));
+  return ret;
+}
+
+static int handle_NPP_GetSitesWithData(rpc_connection_t *connection)
+{
+  D(bug("handle_NPP_GetSitesWithData\n"));
+
+  int error = rpc_method_get_args(connection, RPC_TYPE_INVALID);
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPP_GetSitesWithData() get args", error);
+	return error;
+  }
+
+  char **sites = g_NPP_GetSitesWithData();
+
+  int ret = rpc_method_send_reply(connection,
+								  RPC_TYPE_ARRAY, RPC_TYPE_STRING,
+								  sites ? g_strv_length(sites) : 0, sites,
+								  RPC_TYPE_INVALID);
+  if (sites) {
+	for (int i = 0; sites[i]; i++) {
+	  NPN_MemFree(sites[i]);
+	}
+	NPN_MemFree(sites);
+  }
+
+  return ret;
 }
 
 
@@ -4191,7 +4688,7 @@ static int get_appcontext_input_count_offset(void)
 
 #define n_inputs_max	4 /* number of refinements/input sources */
   int fd, id, n_inputs = 0;
-  struct { int fd, id; } inputs[n_inputs_max] = { 0, };
+  struct { int fd, id; } inputs[n_inputs_max] = { { 0 } };
 
   if ((fd = open("/dev/null", O_WRONLY)) < 0)
 	return 0;
@@ -4367,40 +4864,12 @@ static void xt_source_destroy(void)
   }
 }
 
-// RPC events
-static GPollFD rpc_event_poll_fd;
-
-static gboolean rpc_event_prepare(GSource *source, gint *timeout)
-{
-  *timeout = -1;
-  return FALSE;
-}
-
-static gboolean rpc_event_check(GSource *source)
-{
-  return rpc_wait_dispatch(g_rpc_connection, 0) > 0;
-}
-
-static gboolean rpc_event_dispatch(GSource *source, GSourceFunc callback, gpointer connection)
-{
-  return rpc_dispatch(connection) != RPC_ERROR_CONNECTION_CLOSED;
-}
-
-static GSourceFuncs rpc_event_funcs = {
-  rpc_event_prepare,
-  rpc_event_check,
-  rpc_event_dispatch,
-  (GSourceFinalizeFunc)g_free,
-  (GSourceFunc)NULL,
-  (GSourceDummyMarshal)NULL
-};
-
 // RPC error callback -- kill the plugin
 static void rpc_error_callback_cb(rpc_connection_t *connection, void *user_data)
 {
   D(bug("RPC connection %p is in a bad state, closing the plugin\n",connection));
   rpc_connection_set_error_callback(connection, NULL, NULL);
-  gtk_main_quit();
+  g_is_running = false;
 }
 
 
@@ -4422,7 +4891,7 @@ static int do_main(int argc, char **argv, const char *connection_path)
   D(bug("  Plugin viewer pid: %d\n", getpid()));
 
   thread_check_init();
-  D(bug("  Plugin main thread: %p\n", g_main_thread));
+  D(bug("  Plugin main thread: %p\n", (void*)g_main_thread));
 
   // Cleanup environment, the program may fork/exec a native shell
   // script and having 32-bit libraries in LD_PRELOAD is not right,
@@ -4465,47 +4934,87 @@ static int do_main(int argc, char **argv, const char *connection_path)
 	{ RPC_METHOD_NPP_STREAM_AS_FILE,			handle_NPP_StreamAsFile },
 	{ RPC_METHOD_NPP_PRINT,						handle_NPP_Print },
 	{ RPC_METHOD_NPP_HANDLE_EVENT,				handle_NPP_HandleEvent },
-	{ RPC_METHOD_NPCLASS_INVALIDATE,			npclass_handle_Invalidate },
-	{ RPC_METHOD_NPCLASS_HAS_METHOD,			npclass_handle_HasMethod },
-	{ RPC_METHOD_NPCLASS_INVOKE,				npclass_handle_Invoke },
-	{ RPC_METHOD_NPCLASS_INVOKE_DEFAULT,		npclass_handle_InvokeDefault },
-	{ RPC_METHOD_NPCLASS_HAS_PROPERTY,			npclass_handle_HasProperty },
-	{ RPC_METHOD_NPCLASS_GET_PROPERTY,			npclass_handle_GetProperty },
-	{ RPC_METHOD_NPCLASS_SET_PROPERTY,			npclass_handle_SetProperty },
-	{ RPC_METHOD_NPCLASS_REMOVE_PROPERTY,		npclass_handle_RemoveProperty },
+	{ RPC_METHOD_NPP_CLEAR_SITE_DATA,			handle_NPP_ClearSiteData },
+	{ RPC_METHOD_NPP_GET_SITES_WITH_DATA,		handle_NPP_GetSitesWithData },
   };
   if (rpc_connection_add_method_descriptors(g_rpc_connection, vtable, sizeof(vtable) / sizeof(vtable[0])) < 0) {
 	npw_printf("ERROR: failed to setup NPP method callbacks\n");
+	return 1;
+  }
+  if (npclass_add_method_descriptors(g_rpc_connection) < 0) {
+	npw_printf("ERROR: failed to setup NPClass method callbacks\n");
 	return 1;
   }
 
   id_init();
 
   // Initialize RPC events listener
-  GSource *rpc_source = g_source_new(&rpc_event_funcs, sizeof(GSource));
-  if (rpc_source == NULL) {
-	npw_printf("ERROR: failed to initialize plugin-side RPC events listener\n");
+  int ret = rpc_listen_socket(g_rpc_connection);
+  if (ret < 0) {
+	npw_perror("ERROR: Failed to listen on socket.", ret);
 	return 1;
   }
-  g_source_set_priority(rpc_source, G_PRIORITY_LOW);
-  g_source_attach(rpc_source, NULL);
-  rpc_event_poll_fd.fd = rpc_listen_socket(g_rpc_connection);
-  rpc_event_poll_fd.events = G_IO_IN;
-  rpc_event_poll_fd.revents = 0;
-  g_source_set_callback(rpc_source, (GSourceFunc)rpc_dispatch, g_rpc_connection, NULL);
-  g_source_add_poll(rpc_source, &rpc_event_poll_fd);
 
   // Set error handler - stop plugin if there's a connection error
   rpc_connection_set_error_callback(g_rpc_connection, rpc_error_callback_cb, NULL);
- 
-  gtk_main();
+
+  // Cache the array of FDs to poll.
+  int fds_size = 2;
+  GPollFD *fds = g_new0(GPollFD, fds_size);
+
+  g_is_running = true;
+  GMainContext *context = g_main_context_default();
+
+  // We track the RPC source out-of-band so that we can integrate it
+  // with the remote main loop. Run it at high priority so we do not
+  // delay the browser on an RPC request; it's effectively the highest
+  // priority anyway from the sync mechanism.
+  GPollFD rpc_fd = { 0 };
+  rpc_fd.fd = rpc_socket(g_rpc_connection);
+  rpc_fd.events = G_IO_IN;
+  g_main_context_add_poll(context, &rpc_fd, G_PRIORITY_HIGH);
+
+  while (g_is_running) {
+	/* PREPARE */
+	int max_priority;
+	g_main_context_prepare(context, &max_priority);
+
+	/* QUERY */
+	int timeout, needed_fds;
+	while ((needed_fds = g_main_context_query(context, max_priority, &timeout,
+											  fds, fds_size)) > fds_size) {
+	  // Reallocate to make room
+	  fds_size = needed_fds;
+	  fds = g_renew(GPollFD, fds, fds_size);
+	}
+
+	/* POLL */
+	(g_main_context_get_poll_func(context))(fds, needed_fds, timeout);
+
+	/* CHECK */
+	bool ready = g_main_context_check(context, max_priority, fds, needed_fds);
+
+	/* DISPATCH */
+	if (ready) {
+	  // Before we dispatch, sync with the browser. We don't need to
+	  // check for RPC requests as the rpc_sync will handle them.
+	  rpc_sync(g_rpc_connection);
+	  g_main_context_dispatch(context);
+	  rpc_end_sync(g_rpc_connection);
+	} else if (rpc_fd.revents & rpc_fd.events) {
+	  // We don't have anything, but there is an incoming RPC
+	  // request. Just respond to it. No need to sync.
+	  rpc_dispatch(g_rpc_connection);
+	}
+  }
+  g_main_context_remove_poll(context, &rpc_fd);
+  g_free(fds);
   D(bug("--- EXIT ---\n"));
 
 #if USE_NPIDENTIFIER_CACHE
   npidentifier_cache_destroy();
 #endif
 
-  g_source_destroy(rpc_source);
   if (xt_source)
 	g_source_destroy(xt_source);
 
@@ -4651,22 +5160,22 @@ int main(int argc, char **argv)
 	}
 	handles[n_handles++] = handle;
 	dlerror();
-	g_plugin_NP_GetMIMEDescription = (NP_GetMIMEDescriptionUPP)dlsym(handle, "NP_GetMIMEDescription");
+	g_plugin_NP_GetMIMEDescription = (NP_GetMIMEDescriptionFunc)dlsym(handle, "NP_GetMIMEDescription");
 	if ((error = dlerror()) != NULL) {
 	  npw_printf("ERROR: %s\n", error);
 	  return 1;
 	}
-	g_plugin_NP_Initialize = (NP_InitializeUPP)dlsym(handle, "NP_Initialize");
+	g_plugin_NP_Initialize = (NP_InitializeFunc)dlsym(handle, "NP_Initialize");
 	if ((error = dlerror()) != NULL) {
 	  npw_printf("ERROR: %s\n", error);
 	  return 1;
 	}
-	g_plugin_NP_Shutdown = (NP_ShutdownUPP)dlsym(handle, "NP_Shutdown");
+	g_plugin_NP_Shutdown = (NP_ShutdownFunc)dlsym(handle, "NP_Shutdown");
 	if ((error = dlerror()) != NULL) {
 	  npw_printf("ERROR: %s\n", error);
 	  return 1;
 	}
-	g_plugin_NP_GetValue = (NP_GetValueUPP)dlsym(handle, "NP_GetValue");
+	g_plugin_NP_GetValue = (NP_GetValueFunc)dlsym(handle, "NP_GetValue");
   }
 
   int ret = 1;

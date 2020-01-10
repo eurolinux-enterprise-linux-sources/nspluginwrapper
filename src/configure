@@ -71,7 +71,6 @@ fi
 prefix="/usr"
 lib32=""
 lib64=""
-x_base_dirs=""
 build_viewer="guess"
 build_player="yes"
 build_generic="guess"
@@ -127,6 +126,40 @@ sunos*)
     ;;
 esac
 echo "$os"
+}
+
+print_help() {
+cat << EOF
+
+Usage: configure [options]
+Options: [defaults in brackets after descriptions]
+
+EOF
+echo "Standard options:"
+echo "  --help                      print this message"
+echo "  --prefix=PREFIX             install in PREFIX [$prefix]"
+echo "  --pkglibdir=ROOT            install private files in ROOT [$pkglibdir]"
+echo "  --viewer-paths=PATH         allowed viewer lookup PATH [$viewer_paths]"
+echo "  --target-os=OS              build plugin support for target OS [$target_os]"
+echo "  --target-cpu=CPU            build plugin support for target CPU [$target_cpu]"
+echo "  --enable-viewer             build viewer [$build_viewer]"
+echo "  --enable-player             build player [$build_player]"
+echo ""
+echo "Advanced options (experts only):"
+echo "  --source-path=PATH          path of source code [$source_path]"
+echo "  --enable-strip              strip resulting binaries and libraries [$strip]"
+echo "  --enable-generic            build with generic APIs [$build_generic]"
+echo "  --enable-biarch             build both 32-bit and 64-bit components at once [$build_biarch]"
+echo "  --enable-thread-check       enable main thread checks (DEBUG) [$enable_thread_check]"
+echo "  --enable-malloc-check       enable memory allocation checks (DEBUG) [$enable_malloc_check]"
+echo "  --with-lib32=NAME           use NAME as the 32-bit library dir name [$lib32]"
+echo "  --with-lib64=NAME           use NAME as the 64-bit library dir name [$lib64]"
+echo "  --with-cc=CC                use C compiler CC [$cc]"
+echo "  --with-cxx=CXX              use C++ compiler CXX [$cxx]"
+echo "  --with-malloc=MALLOC        use MALLOC for memory allocation hooks [$malloc_hooks]"
+echo "  --rpc-init-timeout=VALUE    wait VALUE seconds for the plugin to connect [$rpc_init_timeout]"
+echo ""
+echo "NOTE: The object files are built at the place where configure is launched"
 }
 
 for opt do
@@ -194,9 +227,6 @@ case "$opt" in
 --with-lib64=*)
     lib64=`echo "$opt" | cut -d '=' -f 2`
     ;;
---with-x11-prefix=*)
-    x_base_dirs=`echo "$opt" | cut -d '=' -f 2`
-    ;;
 --with-cc=*)
     cc=`echo "$opt" | cut -d '=' -f 2`
     ;;
@@ -209,6 +239,14 @@ case "$opt" in
 --rpc-init-timeout=*)
     rpc_init_timeout=`echo "$opt" | cut -d '=' -f 2`
     ;;
+-h|--help)
+    print_help
+    exit 0
+    ;;
+*)
+    echo "Unrecognized option: $opt"
+    print_help
+    exit 1
 esac
 done
 
@@ -445,10 +483,7 @@ if test "$compiler" = "gcc"; then
 	fi
     fi
     if test "$build_biarch" = "yes" -a -z "$CFLAGS_32"; then
-	CFLAGS_32="-m32 -O2 -g"
-	if check_cc_option -mtune=generic $CFLAGS_32; then
-	    CFLAGS_32="$CFLAGS_32 -mtune=generic"
-	fi
+	CFLAGS_32="-m32 $CFLAGS"
     fi
     if check_cc_option -Wall; then
 	CFLAGS="$CFLAGS -Wall"
@@ -464,8 +499,8 @@ fi
 
 # check for Glib 2.0 compile CFLAGS
 if $pkgconfig --exists glib-2.0; then
-    GLIB_CFLAGS=`$pkgconfig --cflags glib-2.0`
-    GLIB_LDFLAGS=`$pkgconfig --libs glib-2.0`
+    GLIB_CFLAGS=`$pkgconfig --cflags glib-2.0 gthread-2.0`
+    GLIB_LIBS=`$pkgconfig --libs glib-2.0 gthread-2.0`
     GLIB_VERSION=`$pkgconfig --modversion glib-2.0`
 else
     echo "GLIB 2.0 environment not found"
@@ -474,11 +509,11 @@ fi
 cat > $TMPC << EOF
 #include <glib.h>
 int main(void) {
-    (void) g_main_pending();
+    (void) g_main_context_pending(NULL);
     return 0;
 }
 EOF
-if ! $cc $CFLAGS $GLIB_CFLAGS $GLIB_LDFLAGS $TMPC -o $TMPE > /dev/null 2>&1; then
+if ! $cc $CFLAGS $LDFLAGS $GLIB_CFLAGS $TMPC -o $TMPE $GLIB_LIBS > /dev/null 2>&1; then
     echo "GLIB 2.0 environment not usable"
     rm -f $TMPC
     exit 1
@@ -489,7 +524,7 @@ rm -f $TMPC $TMPE
 if test "$build_viewer" = "yes" -o "$build_player" = "yes"; then
     if $pkgconfig --exists gtk+-2.0; then
 	GTK_CFLAGS=`$pkgconfig --cflags gtk+-2.0`
-	GTK_LDFLAGS=`$pkgconfig --libs gtk+-2.0`
+	GTK_LIBS=`$pkgconfig --libs gtk+-2.0`
 	GTK_VERSION=`$pkgconfig --modversion gtk+-2.0`
     else
 	echo "GTK+ 2.0 environment not found"
@@ -502,7 +537,7 @@ int main(void) {
     return 0;
 }
 EOF
-    if ! $cc $CFLAGS $GTK_CFLAGS $GTK_LDFLAGS $TMPC -o $TMPE > /dev/null 2>&1; then
+    if ! $cc $CFLAGS $LDFLAGS $GTK_CFLAGS $TMPC -o $TMPE $GTK_LIBS > /dev/null 2>&1; then
 	echo "GTK+ 2.0 environment not usable"
 	rm -f $TMPC
 	exit 1
@@ -514,12 +549,12 @@ fi
 if test "$build_player" = "yes"; then
     if $pkgconfig --exists libcurl; then
 	CURL_CFLAGS=`$pkgconfig --cflags libcurl`
-	CURL_LDFLAGS=`$pkgconfig --libs libcurl`
+	CURL_LIBS=`$pkgconfig --libs libcurl`
     else
 	curlconfig=`which curl-config`
 	if test -n "$curlconfig"; then
 	    CURL_CFLAGS=`$curlconfig --cflags`
-	    CURL_LDFLAGS=`$curlconfig --libs`
+	    CURL_LIBS=`$curlconfig --libs`
 	else
 	    echo "cURL environment not found"
 	    exit 1
@@ -532,7 +567,7 @@ int main(void) {
     return 0;
 }
 EOF
-    if ! $cc $CFLAGS $CURL_CFLAGS $CURL_LDFLAGS $TMPC -o $TMPE > /dev/null 2>&1; then
+    if ! $cc $CFLAGS $LDFLAGS $CURL_CFLAGS $TMPC -o $TMPE $CURL_LIBS > /dev/null 2>&1; then
 	echo "cURL environment not usable"
 	rm -f $TMPC
 	exit 1
@@ -540,29 +575,27 @@ EOF
     rm -f $TMPC $TMPE
 fi
 
-# check for X11 base dir
-if test -z "$x_base_dirs"; then
-    x_base_dirs="
-	/usr
-	/usr/X11R6
-	/usr/local/X11R6
-	$prefix
-    "
-fi
-for dir in $x_base_dirs; do
-    x_include_dir="$dir/include"
-    if test -f $x_include_dir/X11/Intrinsic.h; then
-	x_lib_dir="$dir/$lib64"
-	if test -f $x_lib_dir/libXt.so; then
-	    x_base_dir=$dir
-	    break
-	fi
-    fi
-done
-if test -z "$x_base_dir"; then
+# check for X11 compile CFLAGS
+if $pkgconfig --exists x11 xt; then
+    X_CFLAGS=`$pkgconfig --cflags x11 xt`
+    X_LIBS=`$pkgconfig --libs x11 xt`
+else
     echo "X11/Xt environment not found"
     exit 1
 fi
+cat > $TMPC << EOF
+#include <X11/Xlib.h>
+int main(void) {
+    (void) XOpenDisplay(NULL);
+    return 0;
+}
+EOF
+if ! $cc $CFLAGS $LDFLAGS $X_CFLAGS $TMPC -o $TMPE $X_LIBS > /dev/null 2>&1; then
+    echo "X11/Xt environment not usable"
+    rm -f $TMPC
+    exit 1
+fi
+rm -f $TMPC $TMPE
 
 # big/little endian test
 cat > $TMPC << EOF
@@ -693,43 +726,6 @@ if test -z "$malloc_hooks"; then
     malloc_hooks="$malloc_hook_default"
 fi
 
-# print configure help
-if test x"$1" = x"-h" -o x"$1" = x"--help" ; then
-cat << EOF
-
-Usage: configure [options]
-Options: [defaults in brackets after descriptions]
-
-EOF
-echo "Standard options:"
-echo "  --help                      print this message"
-echo "  --prefix=PREFIX             install in PREFIX [$prefix]"
-echo "  --pkglibdir=ROOT            install private files in ROOT [$pkglibdir]"
-echo "  --viewer-paths=PATH         allowed viewer lookup PATH [$viewer_paths]"
-echo "  --target-os=OS              build plugin support for target OS [$target_os]"
-echo "  --target-cpu=CPU            build plugin support for target CPU [$target_cpu]"
-echo "  --enable-viewer             build viewer [$build_viewer]"
-echo "  --enable-player             build player [$build_player]"
-echo ""
-echo "Advanced options (experts only):"
-echo "  --source-path=PATH          path of source code [$source_path]"
-echo "  --enable-strip              strip resulting binaries and libraries [$strip]"
-echo "  --enable-generic            build with generic APIs [$build_generic]"
-echo "  --enable-biarch             build both 32-bit and 64-bit components at once [$build_biarch]"
-echo "  --enable-thread-check       enable main thread checks (DEBUG) [$enable_thread_check]"
-echo "  --enable-malloc-check       enable memory allocation checks (DEBUG) [$enable_malloc_check]"
-echo "  --with-lib32=NAME           use NAME as the 32-bit library dir name [$lib32]"
-echo "  --with-lib64=NAME           use NAME as the 64-bit library dir name [$lib64]"
-echo "  --with-x11-prefix=PREFIX    use PREFIX as the X11 base dir [autodetect]"
-echo "  --with-cc=CC                use C compiler CC [$cc]"
-echo "  --with-cxx=CXX              use C++ compiler CXX [$cxx]"
-echo "  --with-malloc=MALLOC        use MALLOC for memory allocation hooks [$malloc_hooks]"
-echo "  --rpc-init-timeout=VALUE    wait VALUE seconds for the plugin to connect [$rpc_init_timeout]"
-echo ""
-echo "NOTE: The object files are built at the place where configure is launched"
-exit 1
-fi
-
 echo "Source path               $source_path"
 echo "Install prefix            $prefix"
 echo "nspluginwrapper root dir  $pkglibdir"
@@ -763,16 +759,20 @@ echo "COMPILER=$compiler" >> $config_mak
 echo "CC=$cc" >> $config_mak
 echo "CXX=$cxx" >> $config_mak
 echo "CFLAGS=$CFLAGS" >> $config_mak
+echo "LDFLAGS=$LDFLAGS" >> $config_mak
 echo "GLIB_CFLAGS=$GLIB_CFLAGS" >> $config_mak
-echo "GLIB_LDFLAGS=$GLIB_LDFLAGS" >> $config_mak
+echo "GLIB_LIBS=$GLIB_LIBS" >> $config_mak
 echo "GTK_CFLAGS=$GTK_CFLAGS" >> $config_mak
-echo "GTK_LDFLAGS=$GTK_LDFLAGS" >> $config_mak
+echo "GTK_LIBS=$GTK_LIBS" >> $config_mak
 echo "CURL_CFLAGS=$CURL_CFLAGS" >> $config_mak
-echo "CURL_LDFLAGS=$CURL_LDFLAGS" >> $config_mak
+echo "CURL_LIBS=$CURL_LIBS" >> $config_mak
+echo "X_CFLAGS=$X_CFLAGS" >> $config_mak
+echo "X_LIBS=$X_LIBS" >> $config_mak
 if test "$build_biarch" = "yes"; then
-echo "LDFLAGS_32=-m32" >> $config_mak
+echo 'LDFLAGS_32=-m32 $(LDFLAGS)' >> $config_mak
 echo "CFLAGS_32=$CFLAGS_32" >> $config_mak
 else
+echo 'LDFLAGS_32=$(LDFLAGS)' >> $config_mak
 echo 'CFLAGS_32=$(CFLAGS)' >> $config_mak
 fi
 if test "$host_os" = "linux"; then
@@ -855,17 +855,19 @@ libdir="$prefix/$lib64"
 echo "libdir=$libdir" >> $config_mak
 echo "#define LIB \"$lib64\"" >> $config_h
 echo "#define LIBDIR \"$libdir\"" >> $config_h
-echo "x11prefix=$x_base_dir" >> $config_mak
 echo "ALLOW_STRIP=$strip" >> $config_mak
 
 echo "VERSION=$VERSION" >> $config_mak
+echo "RELEASE=$RELEASE" >> $config_mak
 echo "SVNDATE=$SVNDATE" >> $config_mak
 echo "SNAPSHOT=$SNAPSHOT" >> $config_mak
 echo "#define NPW_SNAPSHOT $SNAPSHOT" >> $config_h
 if test $SNAPSHOT -ge 2; then
     echo "#define NPW_VERSION \"$VERSION-Pre ($SVNDATE)\"" >> $config_h
+    echo "#define NPW_FULL_VERSION NPW_VERSION" >> $config_h
 else
     echo "#define NPW_VERSION \"$VERSION\"" >> $config_h
+    echo "#define NPW_FULL_VERSION \"$VERSION-$RELEASE\"" >> $config_h
 fi
 
 echo "pkglibdir=$pkglibdir" >> $config_mak
@@ -937,7 +939,7 @@ for func in g_hash_table_remove_all g_hash_table_find; do
 extern void $func(void);
 int main(void) { $func(); return 0; }
 EOF
-    if $cc $TMPC -o $TMPE $GLIB_CFLAGS $GLIB_LDFLAGS > /dev/null 2>&1; then
+    if $cc $CFLAGS $LDFLAGS $TMPC -o $TMPE $GLIB_CFLAGS $GLIB_LIBS > /dev/null 2>&1; then
         func_def=`echo "$func" | tr '[:lower:]./-' '[:upper:]___'`
         echo "#define HAVE_$func_def 1" >> $config_h
     fi

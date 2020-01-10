@@ -41,11 +41,16 @@ int rpc_type_of_NPNVariable(int variable)
   case NPNVisOfflineBool:
   case NPNVSupportsXEmbedBool:
   case NPNVSupportsWindowless:
+  case NPNVprivateModeBool:
+  case NPNVsupportsAdvancedKeyHandling:
 	type = RPC_TYPE_BOOLEAN;
 	break;
   case NPNVToolkit:
   case NPNVnetscapeWindow:
 	type = RPC_TYPE_UINT32;
+	break;
+  case NPNVdocumentOrigin:
+	type = RPC_TYPE_STRING;
 	break;
   case NPNVWindowNPObject:
   case NPNVPluginElementNPObject:
@@ -65,6 +70,7 @@ int rpc_type_of_NPPVariable(int variable)
   case NPPVpluginNameString:
   case NPPVpluginDescriptionString:
   case NPPVformValue: // byte values of 0 does not appear in the UTF-8 encoding but for U+0000
+  case NPPVpluginNativeAccessibleAtkPlugId:
 	type = RPC_TYPE_STRING;
 	break;
   case NPPVpluginWindowSize:
@@ -76,6 +82,11 @@ int rpc_type_of_NPPVariable(int variable)
   case NPPVpluginTransparentBool:
   case NPPVjavascriptPushCallerBool:
   case NPPVpluginKeepLibraryInMemory:
+  case NPPVpluginUrlRequestsDisplayedBool:
+  case NPPVpluginWantsAllNetworkStreams:
+  case NPPVpluginCancelSrcStream:
+  case NPPVsupportsAdvancedKeyHandling:
+  case NPPVpluginUsesDOMForCursorBool:
 	type = RPC_TYPE_BOOLEAN;
 	break;
   case NPPVpluginScriptableNPObject:
@@ -263,9 +274,9 @@ static int do_recv_NPSavedData(rpc_message_t *message, void *p_value)
   if (len == 0)
 	save_area = NULL;
   else {
-	if ((save_area = malloc(sizeof(*save_area))) == NULL)
+	if ((save_area = NPN_MemAlloc(sizeof(*save_area))) == NULL)
 	  return RPC_ERROR_NO_MEMORY;
-	if ((buf = malloc(len)) == NULL)
+	if ((buf = NPN_MemAlloc(len)) == NULL)
 	  return RPC_ERROR_NO_MEMORY;
 	if ((error = rpc_message_recv_bytes(message, buf, len)) < 0)
 	  return error;
@@ -276,8 +287,8 @@ static int do_recv_NPSavedData(rpc_message_t *message, void *p_value)
   if (p_value)
 	*((NPSavedData **)p_value) = save_area;
   else if (save_area) {
-	free(save_area->buf);
-	free(save_area);
+	NPN_MemFree(save_area->buf);
+	NPN_MemFree(save_area);
   }
 
   return RPC_ERROR_NO_ERROR;
@@ -1170,75 +1181,143 @@ static int do_recv_NPPrintData(rpc_message_t *message, void *p_value)
  *  Process NPObject objects
  */
 
-static int do_send_NPObject(rpc_message_t *message, void *p_value)
+enum NPObjectType {
+  NPOBJECT_NULL = 0,
+  NPOBJECT_SENDER_OWNED,
+  NPOBJECT_RECEIVER_OWNED
+};
+
+static int do_send_NPObject_helper(rpc_message_t *message, void *p_value,
+								   bool pass_ref)
 {
-  uint32_t npobj_id = 0;
   NPObject *npobj = (NPObject *)p_value;
+
+  int error;
+  uint32_t type = NPOBJECT_NULL;
+  NPW_PluginInstance *plugin = NULL;
+  uint32_t npobj_id = 0;
+  bool release_stub = false;
+
   if (npobj) {
-	NPObjectInfo *npobj_info = npobject_info_lookup(npobj);
-	if (npobj_info)
-	  npobj_id = npobj_info->npobj_id;
-#ifdef BUILD_WRAPPER
-	else {
-	  // create a new mapping (browser-side)
-	  if ((npobj_info = npobject_info_new(npobj)) == NULL)
-		return RPC_ERROR_NO_MEMORY;
-	  npobj_id = npobj_info->npobj_id;
-	  npobject_associate(npobj, npobj_info);
-	}
+	npobj_id = npobject_get_proxy_id(npobj);
+	if (npobj_id == 0) {
+	  // Sending an object on our side. Allocate a stub so the other
+	  // side can make a proxy.
+	  type = NPOBJECT_SENDER_OWNED;
+	  npobj_id = npobject_create_stub(npobj);
+	  if (pass_ref) {
+		// Release our reference; the stub protects the object from
+		// deallocation.
+		NPN_ReleaseObject(npobj);
+	  }
+#if NPW_IS_PLUGIN
+	  // Get the owning NPP so we can figure out who the owner is.
+	  plugin = npobject_get_owner(npobj);
 #endif
+	} else {
+	  // This is a proxy for the object on the other side. Just pass
+	  // the id along.
+	  type = NPOBJECT_RECEIVER_OWNED;
+	  if (pass_ref) {
+		// As above, we release out reference. If this is not the last
+		// reference, we may just do so. Otherwise, we destroy it, but
+		// do /not/ send the corresponding RPC. That gets merged into
+		// this one.
+		if (npobj->referenceCount == 1) {
+		  npobject_destroy_proxy(npobj, false);
+		  // Tell the other side to destroy the stub after taking a ref.
+		  release_stub = true;
+		} else {
+		  NPN_ReleaseObject(npobj);
+		}
+	  }
+	}
 	assert(npobj_id != 0);
   }
-  int error = rpc_message_send_uint32(message, npobj_id);
-  if (error < 0)
-	return error;
 
-#ifdef BUILD_WRAPPER
-  // synchronize referenceCount
-  if (npobj) {
-	if ((error = rpc_message_send_uint32(message, npobj->referenceCount)) < 0)
+  // This could be significantly trimmed down, but it really doesn't
+  // matter. Latency, not bandwidth, is what we care about.
+  if ((error = rpc_message_send_uint32(message, type)) < 0)
+	return error;
+  if ((error = do_send_NPW_PluginInstance(message, plugin)) < 0)
+	return error;
+  if ((error = rpc_message_send_uint32(message, npobj_id)) < 0)
+	return error;
+  if (pass_ref) {
+	if ((error = rpc_message_send_uint32(message, release_stub)) < 0)
 	  return error;
   }
-#endif
 
   return RPC_ERROR_NO_ERROR;
 }
 
-static int do_recv_NPObject(rpc_message_t *message, void *p_value)
+static int do_recv_NPObject_helper(rpc_message_t *message, void *p_value,
+								   bool pass_ref)
 {
   int error;
-  uint32_t npobj_id;
+  uint32_t type = NPOBJECT_NULL;
+  uint32_t npobj_id = 0;
+  NPW_PluginInstance *plugin = NULL;
+  uint32_t release_stub = 0;
 
+  if ((error = rpc_message_recv_uint32(message, &type)) < 0)
+	return error;
+  if ((error = do_recv_NPW_PluginInstance(message, &plugin)) < 0)
+	return error;
   if ((error = rpc_message_recv_uint32(message, &npobj_id)) < 0)
 	return error;
+  if (pass_ref) {
+	if ((error = rpc_message_recv_uint32(message, &release_stub)) < 0)
+	  return error;
+  }
 
   NPObject *npobj = NULL;
-  if (npobj_id) {
-	npobj = npobject_lookup(npobj_id);
-#ifdef BUILD_VIEWER
-	// create a new mapping (plugin-side)
-	if (npobj == NULL) {
-	  if ((npobj = npobject_new(npobj_id, NULL, NULL)) == NULL)
-		return RPC_ERROR_NO_MEMORY;
+  if (type == NPOBJECT_NULL) {
+	// Do nothing.
+  } else if (type == NPOBJECT_SENDER_OWNED) {
+	// We got a newly-created remote stub. Create a matching proxy.
+	npobj = npobject_create_proxy(NPW_PLUGIN_INSTANCE_NPP(plugin), npobj_id);
+	if (release_stub) {
+	  npw_printf("ERROR: received release_stub for proxy NPObject.\n");
+	  return RPC_ERROR_GENERIC;
 	}
-#endif
+  } else if (type == NPOBJECT_RECEIVER_OWNED) {
+	npobj = npobject_lookup_local(npobj_id);
 	assert(npobj != NULL);
-
-#ifdef BUILD_VIEWER
-	// synchronize referenceCount
-	uint32_t referenceCount;
-	if ((error = rpc_message_recv_uint32(message, &referenceCount)) < 0)
-	  return error;
-	if (npobj->referenceCount != referenceCount) {
-	  D(bug("synchronize NPObject::referenceCount (%d -> %d)\n",
-			npobj->referenceCount, referenceCount));
-	  npobj->referenceCount = referenceCount;
+	// This is an object on our side. Retain it; receiver must
+	// release all received NPObjects.
+	NPN_RetainObject(npobj);
+	if (release_stub) {
+	  // We just retained the object, so it won't be destroyed.
+	  npobject_destroy_stub(npobj_id);
 	}
-#endif
+  } else {
+	npw_printf("ERROR: unknown NPObject type %d\n", type);
+	return RPC_ERROR_GENERIC;
   }
 
   *((NPObject **)p_value) = npobj;
   return RPC_ERROR_NO_ERROR;
+}
+
+static int do_send_NPObject(rpc_message_t *message, void *p_value)
+{
+  return do_send_NPObject_helper(message, p_value, false);
+}
+
+static int do_recv_NPObject(rpc_message_t *message, void *p_value)
+{
+  return do_recv_NPObject_helper(message, p_value, false);
+}
+
+static int do_send_NPObject_pass_ref(rpc_message_t *message, void *p_value)
+{
+  return do_send_NPObject_helper(message, p_value, true);
+}
+
+static int do_recv_NPObject_pass_ref(rpc_message_t *message, void *p_value)
+{
+  return do_recv_NPObject_helper(message, p_value, true);
 }
 
 
@@ -1252,7 +1331,7 @@ static int do_recv_NPObject(rpc_message_t *message, void *p_value)
 // the browser side
 static int do_send_NPIdentifier(rpc_message_t *message, void *p_value)
 {
-  NPIdentifier ident = (NPIdentifier)p_value;
+  NPIdentifier ident = *(NPIdentifier *)p_value;
   int id = 0;
   if (ident) {
 #ifdef BUILD_WRAPPER
@@ -1345,11 +1424,11 @@ static int do_send_NPString(rpc_message_t *message, void *p_value)
   if (string == NULL)
 	return RPC_ERROR_MESSAGE_ARGUMENT_INVALID;
 
-  int error = rpc_message_send_uint32(message, string->utf8length);
+  int error = rpc_message_send_uint32(message, string->UTF8Length);
   if (error < 0)
 	return error;
-  if (string->utf8length && string->utf8characters)
-	return rpc_message_send_bytes(message, (unsigned char *)string->utf8characters, string->utf8length);
+  if (string->UTF8Length && string->UTF8Characters)
+	return rpc_message_send_bytes(message, (unsigned char *)string->UTF8Characters, string->UTF8Length);
   return RPC_ERROR_NO_ERROR;
 }
 
@@ -1358,20 +1437,20 @@ static int do_recv_NPString(rpc_message_t *message, void *p_value)
   NPString *string = (NPString *)p_value;
   if (string == NULL)
 	return RPC_ERROR_MESSAGE_ARGUMENT_INVALID;
-  string->utf8length = 0;
-  string->utf8characters = NULL;
+  string->UTF8Length = 0;
+  string->UTF8Characters = NULL;
 
-  int error = rpc_message_recv_uint32(message, &string->utf8length);
+  int error = rpc_message_recv_uint32(message, &string->UTF8Length);
   if (error < 0)
 	return error;
 
-  if ((string->utf8characters = NPN_MemAlloc(string->utf8length + 1)) == NULL)
+  if ((string->UTF8Characters = NPN_MemAlloc(string->UTF8Length + 1)) == NULL)
 	return RPC_ERROR_NO_MEMORY;
-  if (string->utf8length > 0) {
-	if ((error = rpc_message_recv_bytes(message, (unsigned char *)string->utf8characters, string->utf8length)) < 0)
+  if (string->UTF8Length > 0) {
+	if ((error = rpc_message_recv_bytes(message, (unsigned char *)string->UTF8Characters, string->UTF8Length)) < 0)
 	  return error;
   }
-  ((char *)string->utf8characters)[string->utf8length] = '\0';
+  ((char *)string->UTF8Characters)[string->UTF8Length] = '\0';
   
   return RPC_ERROR_NO_ERROR;
 }
@@ -1381,7 +1460,8 @@ static int do_recv_NPString(rpc_message_t *message, void *p_value)
  *  Process NPVariant objects
  */
 
-static int do_send_NPVariant(rpc_message_t *message, void *p_value)
+static int do_send_NPVariant_helper(rpc_message_t *message, void *p_value,
+									bool pass_ref)
 {
   NPVariant *variant = (NPVariant *)p_value;
   if (variant == NULL)
@@ -1413,22 +1493,23 @@ static int do_send_NPVariant(rpc_message_t *message, void *p_value)
 	  return error;
 	break;
   case NPVariantType_Object:
-	if (NPW_IS_BROWSER) {
-	  /* Note: when we pass an NPObject to the plugin, it's supposed
-		 to be released once it's done with processing the RPC args.
-		 i.e. NPN_ReleaseVariantValue() is called for any NPVariant we
-		 received through rpc_method_get_args(). */
-	  NPN_RetainObject(variant->value.objectValue);
-	}
-	if ((error = do_send_NPObject(message, variant->value.objectValue)) < 0)
+	if ((error = do_send_NPObject_helper(message, variant->value.objectValue,
+										 pass_ref)) < 0)
 	  return error;
 	break;
+  }
+
+  // Clean up local data. If we had an NPObject,
+  // do_send_NPObject_pass_ref took care of it.
+  if (pass_ref && variant->type != NPVariantType_Object) {
+	NPN_ReleaseVariantValue(variant);
   }
 
   return RPC_ERROR_NO_ERROR;
 }
 
-static int do_recv_NPVariant(rpc_message_t *message, void *p_value)
+static int do_recv_NPVariant_helper(rpc_message_t *message, void *p_value,
+									bool pass_ref)
 {
   NPVariant *variant = (NPVariant *)p_value;
   if (variant)
@@ -1468,15 +1549,10 @@ static int do_recv_NPVariant(rpc_message_t *message, void *p_value)
 	  return error;
 	break;
   case NPVariantType_Object:
-	if ((error = do_recv_NPObject(message, &result.value.objectValue)) < 0)
+	if ((error = do_recv_NPObject_helper(message, &result.value.objectValue,
+										 pass_ref)) < 0)
 	  return error;
-	if (NPW_IS_BROWSER) {
-	  /* Note: it's not necessary to propagate the refcount back to
-		 the plugin-side since the object will be unref'ed through
-		 NPN_ReleaseVariantValue() once we are done with processing
-		 the RPC args. */
-	  NPN_RetainObject(result.value.objectValue);
-	}
+	// NPVariant owns reference from do_recv_NPObject_helper.
 	break;
   }
 
@@ -1488,6 +1564,25 @@ static int do_recv_NPVariant(rpc_message_t *message, void *p_value)
   return RPC_ERROR_NO_ERROR;
 }
 
+static int do_send_NPVariant(rpc_message_t *message, void *p_value)
+{
+  return do_send_NPVariant_helper(message, p_value, false);
+}
+
+static int do_recv_NPVariant(rpc_message_t *message, void *p_value)
+{
+  return do_recv_NPVariant_helper(message, p_value, false);
+}
+
+static int do_send_NPVariant_pass_ref(rpc_message_t *message, void *p_value)
+{
+  return do_send_NPVariant_helper(message, p_value, true);
+}
+
+static int do_recv_NPVariant_pass_ref(rpc_message_t *message, void *p_value)
+{
+  return do_recv_NPVariant_helper(message, p_value, true);
+}
 
 /*
  *  Initialize marshalers for NPAPI types
@@ -1579,6 +1674,12 @@ static const rpc_message_descriptor_t message_descs[] = {
 	do_recv_NPObject
   },
   {
+	RPC_TYPE_NP_OBJECT_PASS_REF,
+	sizeof(NPObject *),
+	do_send_NPObject_pass_ref,
+	do_recv_NPObject_pass_ref
+  },
+  {
 	RPC_TYPE_NP_IDENTIFIER,
 	sizeof(NPIdentifier),
 	do_send_NPIdentifier,
@@ -1601,6 +1702,12 @@ static const rpc_message_descriptor_t message_descs[] = {
 	sizeof(NPVariant),
 	do_send_NPVariant,
 	do_recv_NPVariant
+  },
+  {
+	RPC_TYPE_NP_VARIANT_PASS_REF,
+	sizeof(NPVariant),
+	do_send_NPVariant_pass_ref,
+	do_recv_NPVariant_pass_ref
   }
 };
 

@@ -1,3 +1,5 @@
+%define _default_patch_fuzz 2
+
 # Compile as a debug package
 %define make_debug_package 	0
 
@@ -9,7 +11,7 @@
 %define plugin_config_binary plugin-config
 
 # Excluded plugins (separated by ':')
-%define exclude_list 	"libtotem*:libjavaplugin*:gecko-mediaplayer*:mplayerplug-in*:librhythmbox*:packagekit*:libnsISpicec*"
+%define exclude_list 	"libtotem*:libjavaplugin*:gecko-mediaplayer*:mplayerplug-in*:librhythmbox*:packagekit*:libnsISpicec*:libgnashplugin*:liblightsparkplugin*:npesteid*:mozplugger*"
 
 # Target defines
 %if "%{_target_cpu}" == "i386"
@@ -25,6 +27,14 @@
 %endif
 
 %if "%{_target_cpu}" == "ppc"
+%define target_bits	32
+%endif
+
+%if "%{_target_cpu}" == "armv5tel"
+%define target_bits	32
+%endif
+
+%if "%{_target_cpu}" == "armv7hl"
 %define target_bits	32
 %endif
 
@@ -70,39 +80,44 @@
 %define pluginsourcedir	%{pluginsourcedir64}
 %endif
 
+%define svndate 928c322
+
 Summary:	A compatibility layer for Netscape 4 plugins
 Name:		nspluginwrapper
-Version:	1.3.0
-Release:	14%{?dist}
-Source0:	http://gwenole.beauchesne.info/projects/nspluginwrapper/files/%{name}-%{version}%{?svndate:-%{svndate}}.tar.bz2
-Source1:	%{plugin_config_name}.tar.gz
-Source2:	plugin-config.sh.in
-Source3:	%{name}.sh.in
-Patch1:		nspluginwrapper-1.3.0-make.patch
-Patch2:		nspluginwrapper-1.3.0-configure.patch
-Patch3:		nspluginwrapper-1.3.0-directory.patch
-Patch4:		nspluginwrapper-20090625-fix-npident-array-sending.patch
-Patch5:		nspluginwrapper-1.3.0-inst.patch
-Patch6:		nspluginwrapper-1.3.0-compiz.patch
-Patch100:	plugin-config-setuid.patch
-Patch101:	plugin-config-umask.patch
-Patch102:	plugin-config-print.patch
-Patch103:	plugin-config-native.patch
-Patch104:	plugin-config-time-check.patch
+Version:	1.4.4
+Release:	1%{?dist}
 License:	GPLv2+
 Group:		Applications/Internet
 Url:		http://gwenole.beauchesne.info/projects/nspluginwrapper/
-BuildRoot:	%{_tmppath}/%{name}-%{version}-%{release}-buildroot
+ExclusiveArch:	%{ix86} x86_64 ppc
+
+Source0:	http://gwenole.beauchesne.info/projects/nspluginwrapper/files/%{name}-%{version}%{?svndate:-%{svndate}}.tar.gz
+Source1:	%{plugin_config_name}.tar.gz
+Source2:	plugin-config.sh.in
+Source3:	%{name}.sh.in
+Patch1:		nspluginwrapper-1.4.4-make.patch
+Patch3:		nspluginwrapper-1.3.0-directory.patch
+Patch6:		nspluginwrapper-1.3.0-compiz.patch
+Patch7:		nspluginwrapper-1.3.0-comp.patch
+Patch10:	nspluginwrapper-pthread.patch
+Patch11:	nspluginwrapper-arm.patch
+Patch12:	nspluginwrapper-1.4.4-restart.patch
+Patch100:	plugin-config-setuid.patch
+Patch101:	plugin-config-umask.patch
+Patch102:	plugin-config-print.patch
+Patch103:	plugin-config-non-native.patch
+Patch104:	plugin-config-time-check.patch
+
 Provides:	%{name} = %{version}-%{release}
 Requires:	mozilla-filesystem
 BuildRequires:	pkgconfig gtk2-devel glib2-devel nspr-devel
 BuildRequires:	libX11-devel libXt-devel cairo-devel pango-devel libcurl-devel
 BuildRequires:	gecko-devel
-ExclusiveArch:	%{ix86} x86_64 ppc
 
 %description
 nspluginwrapper makes it possible to use Netscape 4 compatible plugins
-compiled for %{_arch} into Mozilla for another architecture, e.g. x86_64.
+compiled for i386 architecture (e.g. flash-plugin) into Mozilla for another 
+architecture, e.g. x86_64.
 
 This package consists in:
   * npviewer: the plugin viewer
@@ -115,19 +130,22 @@ This package consists in:
 
 # Installation & build patches
 %patch1 -p1 -b .make
-%patch2 -p1 -b .conf
 %patch3 -p1 -b .dir
-%patch4 -p0 -b .array
-%patch5 -p1 -b .inst
 %patch6 -p1 -b .compiz
+%patch7 -p1 -b .comp
+THREAD_LIBS=`pkg-config --libs gthread-2.0`
+sed -e "s/__PTHREAD_LIBS__/$THREAD_LIBS/" %{P:%%PATCH10} > pthread.patch
+%{__patch} -p1 -b --suffix .version --fuzz=0 < pthread.patch
+%patch11 -p1 -b .arm
+%patch12 -p1 -b .restart
 
 # Plugin-config patches
 pushd %plugin_config_name
 %patch100 -p2
 %patch101 -p2 -b .umask
 %patch102 -p2 -b .print
-%patch103 -p2 -b .native
-%patch104 -p2 -b .time-check
+%patch103 -p2 -b .non-native
+%patch104 -p2 -b .time
 popd
 
 %build
@@ -145,10 +163,14 @@ popd
 %endif
 
 # set the propper built options
+%ifnarch %{arm}
 %if "%{target_bits}" == "64"
-    export LDFLAGS="-m64 -L%{libdir64}"
+    export LDFLAGS="-m64 -L%{libdir64} -ldl" 
 %else
-    export LDFLAGS="-m32 -L%{libdir32}"
+    export LDFLAGS="-m32 -L%{libdir32} -ldl"
+%endif
+%else
+    export LDFLAGS="-L%{libdir32} -ldl"
 %endif
 
 mkdir %{build_dir}
@@ -156,19 +178,14 @@ pushd %{build_dir}
 ../configure 					\
 	    --prefix=%{_prefix} 		\
 	    --target-cpu=%{_target_cpu}		\
-	    --pkgdir=%{name}			\
 	    --pkglibdir=%{pkgdir}	        \
 	    --with-lib32=%{lib32}		\
 	    --with-lib64=%{lib64}		\
-	    --with-base-lib=%{lib}		\
-	    --with-base-libdir=%{libdir}	\
 	    --viewer-paths=%{pkgdir}		\
-	    --with-x11-prefix=/usr		\
-	    --with-gecko=%{gecko_flavour}	\
 	    --enable-viewer			\
 	    --viewer-paths="%{pkgdir32}:%{pkgdir64}"\
 	    --disable-biarch
-	
+
 make
 popd
 
@@ -209,9 +226,9 @@ cat %{SOURCE3} | %{__sed} -e "s|EXCLUDE_LIST|%{exclude_list}|g" \
 chmod 644 $RPM_BUILD_ROOT%{_sysconfdir}/sysconfig/%{name}
 
 # set up nsplugin player starting script
-%{__cat} > $RPM_BUILD_ROOT%{pkgdir}/nspluginplayer << EOF
+cat > $RPM_BUILD_ROOT%{pkgdir}/nspluginplayer << EOF
 export MOZ_PLUGIN_PATH=%{pluginsourcedir}
-%{pkgdir}/npplayer "$@"
+%{pkgdir}/npplayer "\$@"
 EOF
 chmod 755 $RPM_BUILD_ROOT%{pkgdir}/nspluginplayer
 
@@ -243,15 +260,18 @@ fi;
 %{pkgdir}/npviewer.sh
 %{pkgdir}/npviewer
 %{pkgdir}/npplayer
-%{pkgdir}/libxpcom.so
 %{pkgdir}/libnoxshm.so
 %{pkgdir}/nspluginplayer
 %{plugindir}/npwrapper.so
 %{_bindir}/mozilla-plugin-config
-%config %{_sysconfdir}/sysconfig/%{name}
+%config(noreplace) %{_sysconfdir}/sysconfig/%{name}
 
 
 %changelog
+* Mon Oct 22 2012 Martin Stransky <stransky@redhat.com> 1.4.4-1
+- Rebase the package to latest upstream
+- Added Adobe reader fix (#645599)
+
 * Wed Jun 30 2010 Martin Stransky <stransky@redhat.com> 1.3.0-14
 - Fixed patch for rhbz#603564
 

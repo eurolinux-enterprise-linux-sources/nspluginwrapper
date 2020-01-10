@@ -29,13 +29,12 @@
 #define XP_UNIX 1
 #define MOZ_X11 1
 #include <npapi.h>
-#include <npupp.h>
+#include <npfunctions.h>
 #include <npruntime.h>
-#include "npruntime-impl.h"
 
 /* Supported NPAPI interfaces */
-#define NPW_NPAPI_VERSION		17
-#define NPW_NP_CLASS_STRUCT_VERSION	1
+#define NPW_NPAPI_VERSION		27
+#define NPW_NP_CLASS_STRUCT_VERSION	3
 #define NPW_TOOLKIT			NPNVGtk2
 
 /* What are we building? */
@@ -48,6 +47,8 @@
 #endif
 #define NPW_IS_PLUGIN (!NPW_IS_BROWSER)
 
+#include "npruntime-impl.h"
+
 #if NPW_IS_BROWSER
 # define _NPW_INSTANCE_PRIVATE_DATA pdata
 #else
@@ -57,7 +58,7 @@
 /* PluginInstance */
 #define NPW_DECL_PLUGIN_INSTANCE		\
   NPW_PluginInstanceClass *klass;		\
-  uint32_t                 refcount;		\
+  volatile int             refcount;		\
   NPP                      instance;		\
   uint32_t                 instance_id;		\
   bool                     is_valid
@@ -115,7 +116,7 @@ npw_plugin_instance_is_valid(void *ptr)
 static inline NPW_PluginInstance *
 _npw_get_plugin_instance (NPP instance)
 {
-  return (NPW_PluginInstance *)instance->_NPW_INSTANCE_PRIVATE_DATA;
+  return instance ? (NPW_PluginInstance *)instance->_NPW_INSTANCE_PRIVATE_DATA : NULL;
 }
 
 static inline NPW_PluginInstance *
@@ -211,19 +212,19 @@ struct _NPW_Identifier
 
 /* Create identifier from an integer */
 NPW_Identifier
-NPW_CreateIntIdentifier (int32_t value);
+NPW_CreateIntIdentifier (int32_t value) attribute_hidden;
 
 /* Create identifier from a string (that is copied) */
 NPW_Identifier
-NPW_CreateStringIdentifier (const char *str);
+NPW_CreateStringIdentifier (const char *str) attribute_hidden;
 
 /* Create identifier from a string (that is now owned by the identifier) */
 NPW_Identifier
-NPW_CreateStringIdentifierSink (char *str);
+NPW_CreateStringIdentifierSink (char *str) attribute_hidden;
 
 /* Destroy identifier */
 void
-NPW_DestroyIdentifier (NPW_Identifier id);
+NPW_DestroyIdentifier (NPW_Identifier id) attribute_hidden;
 
 /* Check whether identifier is an integer */
 static inline bool
@@ -252,5 +253,10 @@ NPW_GetStringIdentifierValue (NPW_Identifier id)
 {
   return NPW_IsStringIdentifier (id) ? id->value.s : 0;
 }
+
+/* Reallocates a buffer with NPN_MemAlloc. Returns
+ * NPERR_OUT_OF_MEMORY_ERROR if NPN_MemAlloc fails. */
+NPError
+NPW_ReallocData(void *ptr, uint32_t size, void **out) attribute_hidden;
 
 #endif /* NPW_COMMON_H */

@@ -19,13 +19,16 @@
  */
 
 #include "sysdeps.h"
+
+#include <errno.h>
+#include <dlfcn.h>
 #include <unistd.h>
 #include <glib.h>
 #include <glib/gstdio.h>
-#include <glib/gthread.h>
 #include <gtk/gtk.h>
 #include <gdk/gdkx.h>
 #include <gdk/gdkkeysyms.h>
+
 #include "rpc.h"
 #include "utils.h"
 #include "glibcurl.h"
@@ -35,7 +38,8 @@
 #define XP_UNIX 1
 #define MOZ_X11 1
 #include <npapi.h>
-#include <npupp.h>
+#include <npfunctions.h>
+#include <npruntime.h>
 
 #define DEBUG 1
 #include "debug.h"
@@ -53,6 +57,7 @@ enum
 
 static gboolean g_verbose     = FALSE;
 static guint g_backend        = BACKEND_GTK;
+static guint g_xid            = 0;
 static guint g_n_plugins      = 0;
 
 typedef struct _Plugin		Plugin;
@@ -61,11 +66,6 @@ typedef struct _StreamInstance  StreamInstance;
 typedef struct _StreamBuffer    StreamBuffer;
 typedef struct _PlayerApp	PlayerApp;
 typedef struct _GtkDisplay	GtkDisplay;
-
-typedef NPError (*NP_InitializeUPP) (NPNetscapeFuncs *, NPPluginFuncs *);
-typedef NPError (*NP_ShutdownUPP) (void);
-typedef NPError (*NP_GetValueUPP) (void *, NPPVariable, void *);
-typedef char *  (*NP_GetMIMEDescriptionUPP) (void);
 
 #define GTK_DISPLAY(display)		((GtkDisplay *)(display))
 #define APP_GTK_DISPLAY(app)		GTK_DISPLAY ((app)->display)
@@ -97,20 +97,19 @@ struct _Plugin
   gchar                   *path;
   gchar                   *src;
   gchar                   *mime_type;
-  GModule                 *module;
+  void                    *module;
   GList                   *data_types;
   GtkWidget               *window;
   gboolean                 use_xembed;
 
-  rpc_connection_t *     (*get_master_connection)(void);
-  NPP                      instance;
-  NPWindow                 np_window;
-  NP_InitializeUPP         NP_Initialize;
-  NP_ShutdownUPP           NP_Shutdown;
-  NP_GetValueUPP           NP_GetValue;
-  NP_GetMIMEDescriptionUPP NP_GetMIMEDescription;
-  NPPluginFuncs            plugin_funcs;
-  NPNetscapeFuncs          mozilla_funcs;
+  NPP                       instance;
+  NPWindow                  np_window;
+  NP_InitializeFunc         NP_Initialize;
+  NP_ShutdownFunc           NP_Shutdown;
+  NP_GetValueFunc           NP_GetValue;
+  NP_GetMIMEDescriptionFunc NP_GetMIMEDescription;
+  NPPluginFuncs             plugin_funcs;
+  NPNetscapeFuncs           mozilla_funcs;
 };
 
 enum
@@ -215,7 +214,7 @@ uri_type_from_url (const gchar *url)
 }
 
 /* Sanitize URL, e.g. translate local file names to file:// syntax */
-gchar *
+static gchar *
 sanitize_url (const gchar *uri)
 {
   /* Local contents has preference if no URI scheme is specified.
@@ -386,7 +385,7 @@ g_NPN_Evaluate (NPP instance, NPObject *npobj, NPString *script, NPVariant *resu
   if (result)
     VOID_TO_NPVARIANT (*result);
 
-  if (!script || !script->utf8length || !script->utf8characters)
+  if (!script || !script->UTF8Length || !script->UTF8Characters)
     return true; // nothing to evaluate
 
   UNIMPLEMENTED();
@@ -455,10 +454,10 @@ g_NPN_ReleaseVariantValue (NPVariant *variant)
     case NPVariantType_String:
       {
 	NPString *s = &NPVARIANT_TO_STRING (*variant);
-	if (s->utf8characters)
+	if (s->UTF8Characters)
 	  {
-	    g_free ((gpointer)s->utf8characters);
-	    s->utf8characters = NULL;
+	    g_free ((gpointer)s->UTF8Characters);
+	    s->UTF8Characters = NULL;
 	  }
 	break;
       }
@@ -532,7 +531,7 @@ g_NPN_GetStringIdentifier (const NPUTF8 *name)
 }
 
 static void
-g_NPN_GetStringIdentifiers (const NPUTF8 **names, uint32_t nameCount, NPIdentifier *identifiers)
+g_NPN_GetStringIdentifiers (const NPUTF8 **names, int32_t nameCount, NPIdentifier *identifiers)
 {
   if (names == NULL)
     return;
@@ -605,10 +604,10 @@ g_NPN_GetValue (NPP instance, NPNVariable variable, void *value)
     *(NPNToolkitType *)value = NPNVGtk2;
     break;
   case NPNVSupportsXEmbedBool:
-    *(PRBool *)value = USE_XEMBED;
+    *(NPBool *)value = USE_XEMBED;
     break;
   default:
-    npw_printf ("WARNING: unhandled variable %d in NPN_GetValue()\n", variable);
+    D(bug("WARNING: unhandled variable %d in NPN_GetValue()\n", variable));
     return NPERR_INVALID_PARAM;
   }
 
@@ -659,7 +658,7 @@ g_NPN_GetURLNotify (NPP instance, const char *url, const char *target, void *not
 }
 
 static NPError
-g_NPN_PostURL (NPP instance, const char *url, const char *target, uint32 len, const char *buf, NPBool file)
+g_NPN_PostURL (NPP instance, const char *url, const char *target, uint32_t len, const char *buf, NPBool file)
 {
   if (instance == NULL)
     return NPERR_INVALID_INSTANCE_ERROR;
@@ -672,7 +671,7 @@ g_NPN_PostURL (NPP instance, const char *url, const char *target, uint32 len, co
 }
 
 static NPError
-g_NPN_PostURLNotify (NPP instance, const char *url, const char *target, uint32 len, const char *buf, NPBool file, void *notifyData)
+g_NPN_PostURLNotify (NPP instance, const char *url, const char *target, uint32_t len, const char *buf, NPBool file, void *notifyData)
 {
   if (instance == NULL)
     return NPERR_INVALID_INSTANCE_ERROR;
@@ -731,8 +730,8 @@ g_NPN_RequestRead (NPStream *stream, NPByteRange *rangeList)
   return NPERR_GENERIC_ERROR;
 }
 
-static int32
-g_NPN_Write (NPP instance, NPStream *stream, int32 len, void *buf)
+static int32_t
+g_NPN_Write (NPP instance, NPStream *stream, int32_t len, void *buf)
 {
   if (instance == NULL)
     return -1;
@@ -748,15 +747,15 @@ g_NPN_Write (NPP instance, NPStream *stream, int32 len, void *buf)
 }
 
 static void *
-g_NPN_MemAlloc (uint32 size)
+g_NPN_MemAlloc (uint32_t size)
 {
   D(bug("NPN_MemAlloc size %u\n", size));
 
   return g_malloc (size);
 }
 
-static uint32
-g_NPN_MemFlush (uint32 size)
+static uint32_t
+g_NPN_MemFlush (uint32_t size)
 {
   D(bug("NPN_MemFlush size %u\n", size));
 
@@ -803,7 +802,7 @@ g_NPN_ForceRedraw(NPP instance)
   UNIMPLEMENTED();
 }
 
-static JRIEnv *
+static void *
 g_NPN_GetJavaEnv(void)
 {
   D(bug("NPN_GetJavaEnv\n"));
@@ -811,7 +810,7 @@ g_NPN_GetJavaEnv(void)
   return NULL;
 }
 
-static jref
+static void *
 g_NPN_GetJavaPeer (NPP instance)
 {
   D(bug("NPN_GetJavaPeer instance %p\n", instance));
@@ -848,56 +847,58 @@ g_NP_Initialize (Plugin *plugin)
 
   memset (&plugin->plugin_funcs, 0, sizeof (plugin->plugin_funcs));
   plugin->plugin_funcs.size = sizeof (plugin->plugin_funcs);
+  plugin->plugin_funcs.version = 19;
 
   memset (&plugin->mozilla_funcs, 0, sizeof (plugin->mozilla_funcs));
   plugin->mozilla_funcs.size = sizeof (plugin->mozilla_funcs);
-  plugin->mozilla_funcs.version = NP_VERSION_MINOR; /* XXX: make it the "compatible" way */
-  plugin->mozilla_funcs.geturl = NewNPN_GetURLProc (g_NPN_GetURL);
-  plugin->mozilla_funcs.posturl = NewNPN_PostURLProc (g_NPN_PostURL);
-  plugin->mozilla_funcs.requestread = NewNPN_RequestReadProc (g_NPN_RequestRead);
-  plugin->mozilla_funcs.newstream = NewNPN_NewStreamProc (g_NPN_NewStream);
-  plugin->mozilla_funcs.write = NewNPN_WriteProc (g_NPN_Write);
-  plugin->mozilla_funcs.destroystream = NewNPN_DestroyStreamProc (g_NPN_DestroyStream);
-  plugin->mozilla_funcs.status = NewNPN_StatusProc (g_NPN_Status);
-  plugin->mozilla_funcs.uagent = NewNPN_UserAgentProc (g_NPN_UserAgent);
-  plugin->mozilla_funcs.memalloc = NewNPN_MemAllocProc (g_NPN_MemAlloc);
-  plugin->mozilla_funcs.memfree = NewNPN_MemFreeProc (g_NPN_MemFree);
-  plugin->mozilla_funcs.memflush = NewNPN_MemFlushProc (g_NPN_MemFlush);
-  plugin->mozilla_funcs.reloadplugins = NewNPN_ReloadPluginsProc (g_NPN_ReloadPlugins);
-  plugin->mozilla_funcs.getJavaEnv = NewNPN_GetJavaEnvProc (g_NPN_GetJavaEnv);
-  plugin->mozilla_funcs.getJavaPeer = NewNPN_GetJavaPeerProc (g_NPN_GetJavaPeer);
-  plugin->mozilla_funcs.geturlnotify = NewNPN_GetURLNotifyProc (g_NPN_GetURLNotify);
-  plugin->mozilla_funcs.posturlnotify = NewNPN_PostURLNotifyProc (g_NPN_PostURLNotify);
-  plugin->mozilla_funcs.getvalue = NewNPN_GetValueProc (g_NPN_GetValue);
-  plugin->mozilla_funcs.setvalue = NewNPN_SetValueProc (g_NPN_SetValue);
-  plugin->mozilla_funcs.invalidaterect = NewNPN_InvalidateRectProc (g_NPN_InvalidateRect);
-  plugin->mozilla_funcs.invalidateregion = NewNPN_InvalidateRegionProc (g_NPN_InvalidateRegion);
-  plugin->mozilla_funcs.forceredraw = NewNPN_ForceRedrawProc (g_NPN_ForceRedraw);
-  plugin->mozilla_funcs.pushpopupsenabledstate = NewNPN_PushPopupsEnabledStateProc (g_NPN_PushPopupsEnabledState);
-  plugin->mozilla_funcs.poppopupsenabledstate = NewNPN_PopPopupsEnabledStateProc (g_NPN_PopPopupsEnabledState);
+  /* TODO: update this to wrap a more recent NPAPI version  */
+  plugin->mozilla_funcs.version = 19; /* (NP_VERSION_MAJOR << 8) | NP_VERSION_MINOR; */
+  plugin->mozilla_funcs.geturl = g_NPN_GetURL;
+  plugin->mozilla_funcs.posturl = g_NPN_PostURL;
+  plugin->mozilla_funcs.requestread = g_NPN_RequestRead;
+  plugin->mozilla_funcs.newstream = g_NPN_NewStream;
+  plugin->mozilla_funcs.write = g_NPN_Write;
+  plugin->mozilla_funcs.destroystream = g_NPN_DestroyStream;
+  plugin->mozilla_funcs.status = g_NPN_Status;
+  plugin->mozilla_funcs.uagent = g_NPN_UserAgent;
+  plugin->mozilla_funcs.memalloc = g_NPN_MemAlloc;
+  plugin->mozilla_funcs.memfree = g_NPN_MemFree;
+  plugin->mozilla_funcs.memflush = g_NPN_MemFlush;
+  plugin->mozilla_funcs.reloadplugins = g_NPN_ReloadPlugins;
+  plugin->mozilla_funcs.getJavaEnv = g_NPN_GetJavaEnv;
+  plugin->mozilla_funcs.getJavaPeer = g_NPN_GetJavaPeer;
+  plugin->mozilla_funcs.geturlnotify = g_NPN_GetURLNotify;
+  plugin->mozilla_funcs.posturlnotify = g_NPN_PostURLNotify;
+  plugin->mozilla_funcs.getvalue = g_NPN_GetValue;
+  plugin->mozilla_funcs.setvalue = g_NPN_SetValue;
+  plugin->mozilla_funcs.invalidaterect = g_NPN_InvalidateRect;
+  plugin->mozilla_funcs.invalidateregion = g_NPN_InvalidateRegion;
+  plugin->mozilla_funcs.forceredraw = g_NPN_ForceRedraw;
+  plugin->mozilla_funcs.pushpopupsenabledstate = g_NPN_PushPopupsEnabledState;
+  plugin->mozilla_funcs.poppopupsenabledstate = g_NPN_PopPopupsEnabledState;
 
   if ((plugin->mozilla_funcs.version & 0xff) >= NPVERS_HAS_NPRUNTIME_SCRIPTING)
     {
       D(bug(" browser supports scripting through npruntime\n"));
-      plugin->mozilla_funcs.getstringidentifier = NewNPN_GetStringIdentifierProc (g_NPN_GetStringIdentifier);
-      plugin->mozilla_funcs.getstringidentifiers = NewNPN_GetStringIdentifiersProc (g_NPN_GetStringIdentifiers);
-      plugin->mozilla_funcs.getintidentifier = NewNPN_GetIntIdentifierProc (g_NPN_GetIntIdentifier);
-      plugin->mozilla_funcs.identifierisstring = NewNPN_IdentifierIsStringProc (g_NPN_IdentifierIsString);
-      plugin->mozilla_funcs.utf8fromidentifier = NewNPN_UTF8FromIdentifierProc (g_NPN_UTF8FromIdentifier);
-      plugin->mozilla_funcs.intfromidentifier = NewNPN_IntFromIdentifierProc (g_NPN_IntFromIdentifier);
-      plugin->mozilla_funcs.createobject = NewNPN_CreateObjectProc (g_NPN_CreateObject);
-      plugin->mozilla_funcs.retainobject = NewNPN_RetainObjectProc (g_NPN_RetainObject);
-      plugin->mozilla_funcs.releaseobject = NewNPN_ReleaseObjectProc (g_NPN_ReleaseObject);
-      plugin->mozilla_funcs.invoke = NewNPN_InvokeProc (g_NPN_Invoke);
-      plugin->mozilla_funcs.invokeDefault = NewNPN_InvokeDefaultProc (g_NPN_InvokeDefault);
-      plugin->mozilla_funcs.evaluate = NewNPN_EvaluateProc (g_NPN_Evaluate);
-      plugin->mozilla_funcs.getproperty = NewNPN_GetPropertyProc (g_NPN_GetProperty);
-      plugin->mozilla_funcs.setproperty = NewNPN_SetPropertyProc (g_NPN_SetProperty);
-      plugin->mozilla_funcs.removeproperty = NewNPN_RemovePropertyProc (g_NPN_RemoveProperty);
-      plugin->mozilla_funcs.hasproperty = NewNPN_HasPropertyProc (g_NPN_HasProperty);
-      plugin->mozilla_funcs.hasmethod = NewNPN_HasMethodProc (g_NPN_HasMethod);
-      plugin->mozilla_funcs.releasevariantvalue = NewNPN_ReleaseVariantValueProc (g_NPN_ReleaseVariantValue);
-      plugin->mozilla_funcs.setexception = NewNPN_SetExceptionProc (g_NPN_SetException);
+      plugin->mozilla_funcs.getstringidentifier = g_NPN_GetStringIdentifier;
+      plugin->mozilla_funcs.getstringidentifiers = g_NPN_GetStringIdentifiers;
+      plugin->mozilla_funcs.getintidentifier = g_NPN_GetIntIdentifier;
+      plugin->mozilla_funcs.identifierisstring = g_NPN_IdentifierIsString;
+      plugin->mozilla_funcs.utf8fromidentifier = g_NPN_UTF8FromIdentifier;
+      plugin->mozilla_funcs.intfromidentifier = g_NPN_IntFromIdentifier;
+      plugin->mozilla_funcs.createobject = g_NPN_CreateObject;
+      plugin->mozilla_funcs.retainobject = g_NPN_RetainObject;
+      plugin->mozilla_funcs.releaseobject = g_NPN_ReleaseObject;
+      plugin->mozilla_funcs.invoke = g_NPN_Invoke;
+      plugin->mozilla_funcs.invokeDefault = g_NPN_InvokeDefault;
+      plugin->mozilla_funcs.evaluate = g_NPN_Evaluate;
+      plugin->mozilla_funcs.getproperty = g_NPN_GetProperty;
+      plugin->mozilla_funcs.setproperty = g_NPN_SetProperty;
+      plugin->mozilla_funcs.removeproperty = g_NPN_RemoveProperty;
+      plugin->mozilla_funcs.hasproperty = g_NPN_HasProperty;
+      plugin->mozilla_funcs.hasmethod = g_NPN_HasMethod;
+      plugin->mozilla_funcs.releasevariantvalue = g_NPN_ReleaseVariantValue;
+      plugin->mozilla_funcs.setexception = g_NPN_SetException;
     }
 
   return plugin->NP_Initialize (&plugin->mozilla_funcs, &plugin->plugin_funcs);
@@ -963,7 +964,7 @@ g_NPP_New (Plugin *plugin, guint16 mode, GHashTable *attrs, guint w, guint h)
   g_return_val_if_fail (arg.names->len  == n_args, NPERR_GENERIC_ERROR);
   g_return_val_if_fail (arg.values->len == n_args, NPERR_GENERIC_ERROR);
 
-  NPError ret = CallNPP_NewProc (plugin->plugin_funcs.newp,
+  NPError ret = plugin->plugin_funcs.newp(
 				 plugin->mime_type,
 				 plugin->instance,
 				 mode,
@@ -978,13 +979,13 @@ g_NPP_New (Plugin *plugin, guint16 mode, GHashTable *attrs, guint w, guint h)
   g_ptr_array_free (arg.values, TRUE);
 
   // check if XEMBED is to be used
-  PRBool supports_XEmbed = PR_FALSE;
+  long supports_XEmbed = FALSE;
   if (plugin->mozilla_funcs.getvalue)
     {
       NPError error = plugin->mozilla_funcs.getvalue (NULL, NPNVSupportsXEmbedBool, (void *)&supports_XEmbed);
       if (error == NPERR_NO_ERROR && plugin->plugin_funcs.getvalue)
 	{
-	  PRBool needs_XEmbed = PR_FALSE;
+	  long needs_XEmbed = FALSE;
 	  error = plugin->plugin_funcs.getvalue (plugin->instance, NPPVpluginNeedsXEmbed, (void *)&needs_XEmbed);
 	  if (error == NPERR_NO_ERROR)
 	    plugin->use_xembed = supports_XEmbed && needs_XEmbed;
@@ -1004,9 +1005,7 @@ g_NPP_Destroy (Plugin *plugin)
 
   NPSavedData save_data;
   NPSavedData *psave_data = &save_data;
-  NPError ret = CallNPP_DestroyProc (plugin->plugin_funcs.destroy,
-				     plugin->instance,
-				     &psave_data);
+  NPError ret = plugin->plugin_funcs.destroy(plugin->instance, &psave_data);
 
   if (plugin->instance)
     {
@@ -1095,9 +1094,7 @@ g_NPP_SetWindow (Plugin *plugin, GtkWidget *parent, gpointer display)
 	}
     }
 
-  return CallNPP_SetWindowProc (plugin->plugin_funcs.setwindow,
-				plugin->instance,
-				&plugin->np_window);
+  return plugin->plugin_funcs.setwindow(plugin->instance, &plugin->np_window);
 }
 
 static NPError
@@ -1110,7 +1107,7 @@ g_NPP_NewStream (StreamInstance *pstream)
   if (plugin == NULL || plugin->instance == NULL)
     return NPERR_INVALID_INSTANCE_ERROR;
 
-  return CallNPP_NewStreamProc (plugin->plugin_funcs.newstream,
+  return plugin->plugin_funcs.newstream(
 				plugin->instance,
 				pstream->mime_type,
 				pstream->np_stream,
@@ -1132,13 +1129,13 @@ g_NPP_DestroyStream (StreamInstance *pstream)
   if (pstream->status & STREAM_STATUS_ERROR)
     reason = NPRES_NETWORK_ERR;
 
-  return CallNPP_DestroyStreamProc (plugin->plugin_funcs.destroystream,
+  return plugin->plugin_funcs.destroystream(
 				    plugin->instance,
 				    pstream->np_stream,
 				    reason);
 }
 
-static int32
+static int32_t
 g_NPP_WriteReady (StreamInstance *pstream)
 {
   if (pstream == NULL)
@@ -1148,12 +1145,12 @@ g_NPP_WriteReady (StreamInstance *pstream)
   if (plugin == NULL || plugin->instance == NULL)
     return -1;
 
-  return CallNPP_WriteReadyProc (plugin->plugin_funcs.writeready,
+  return plugin->plugin_funcs.writeready(
 				 plugin->instance,
 				 pstream->np_stream);
 }
 
-static int32
+static int32_t
 g_NPP_Write (StreamInstance *pstream, StreamBuffer *buffer, guint32 len)
 {
   if (pstream == NULL)
@@ -1166,7 +1163,7 @@ g_NPP_Write (StreamInstance *pstream, StreamBuffer *buffer, guint32 len)
   if (plugin == NULL || plugin->instance == NULL)
     return -1;
 
-  return CallNPP_WriteProc (plugin->plugin_funcs.write,
+  return plugin->plugin_funcs.write(
 			    plugin->instance,
 			    pstream->np_stream,
 			    pstream->offset,
@@ -1187,7 +1184,7 @@ g_NPP_StreamAsFile (StreamInstance *pstream, const gchar *filename)
   if (g_ascii_strncasecmp (filename, "file://", 7) == 0)
     filename += 7;
 
-  CallNPP_StreamAsFileProc (plugin->plugin_funcs.asfile,
+  plugin->plugin_funcs.asfile(
 			    plugin->instance,
 			    pstream->np_stream,
 			    filename);
@@ -1207,7 +1204,7 @@ g_NPP_URLNotify (StreamInstance *pstream)
   if (pstream->status & STREAM_STATUS_ERROR)
     reason = NPRES_NETWORK_ERR;
 
-  CallNPP_URLNotifyProc (plugin->plugin_funcs.urlnotify,
+  plugin->plugin_funcs.urlnotify(
 			 plugin->instance,
 			 pstream->np_stream->url,
 			 reason,
@@ -1235,6 +1232,7 @@ np_stream_new (const gchar *url, void *notify_data)
     return NULL;
 
   curl_easy_setopt (handle, CURLOPT_URL, url);
+  curl_easy_setopt (handle, CURLOPT_NOSIGNAL, 1);
   curl_easy_setopt (handle, CURLOPT_WRITEFUNCTION, on_stream_read_nothing_cb);
   curl_easy_setopt (handle, CURLOPT_FILETIME, 1);
   curl_easy_setopt (handle, CURLOPT_TIMECONDITION, CURL_TIMECOND_LASTMOD);
@@ -1432,16 +1430,16 @@ stream_use_npp_write (StreamInstance *pstream)
   return TRUE;
 }
 
-static int32
+static int32_t
 stream_write_ready (StreamInstance *pstream)
 {
-  int32 write_ready = 0x0fffff;
+  int32_t write_ready = 0x0fffff;
   if (stream_use_npp_write (pstream))
     write_ready = g_NPP_WriteReady (pstream);
   return write_ready;
 }
 
-static int32
+static int32_t
 stream_write (StreamInstance *pstream, StreamBuffer *buffer, guint32 len)
 {
   switch (pstream->stype)
@@ -1513,7 +1511,7 @@ on_stream_commit_cb (gpointer user_data)
 	  pstream->status |= STREAM_STATUS_ACTIVE;
 	}
 
-      int32 write_ready = stream_write_ready (pstream);
+      int32_t write_ready = stream_write_ready (pstream);
 
       if (write_ready < 0)
 	{
@@ -1522,7 +1520,7 @@ on_stream_commit_cb (gpointer user_data)
 	}
       else if (write_ready > 0)
 	{
-	  int32 len = MIN (buffer->size - buffer->offset, write_ready);
+	  int32_t len = MIN (buffer->size - buffer->offset, write_ready);
 
 	  len = stream_write (pstream, buffer, len);
 
@@ -1600,11 +1598,22 @@ on_stream_open_cb (gpointer user_data)
        */
       if (pstream->uri_type != URI_TYPE_FILE)
 	{
-	  /* XXX: handle errors! */
-	  /* XXX: better use tmpfile() but how to get the filename in a portable way? */
-	  pstream->temp_filename = g_malloc (L_tmpnam + 1);
-	  tmpnam (pstream->temp_filename);
-	  pstream->temp_file = fopen (pstream->temp_filename, "w");
+	  GError *error = NULL;
+	  int fd = g_file_open_tmp (NULL, &pstream->temp_filename, &error);
+	  if (fd < 0) {
+	    npw_printf ("ERROR: Could not open temporary file: %s\n",
+			error->message);
+	    g_error_free (error);
+	    return FALSE;
+	  }
+	  pstream->temp_file = fdopen (fd, "w");
+	  if (pstream->temp_file == NULL) {
+	    npw_printf ("ERROR: fdopen failed: %s\n", strerror (errno));
+	    close (fd);
+	    g_free (pstream->temp_filename);
+	    pstream->temp_filename = NULL;
+	    return FALSE;
+	  }
 	}
       break;
     default:
@@ -1617,6 +1626,7 @@ on_stream_open_cb (gpointer user_data)
 
   CURL * const handle = pstream->curl_handle;
   curl_easy_setopt (handle, CURLOPT_URL, pstream->np_stream->url);
+  curl_easy_setopt (handle, CURLOPT_NOSIGNAL, 1);
   curl_easy_setopt (handle, CURLOPT_WRITEFUNCTION, on_stream_read_cb);
   curl_easy_setopt (handle, CURLOPT_WRITEDATA, pstream);
   curl_easy_setopt (handle, CURLOPT_PRIVATE, pstream);
@@ -1638,10 +1648,15 @@ on_stream_close_cb (gpointer user_data)
 	continue;
 
       StreamInstance *pstream;
+      char *pstream_;
       
       CURL *handle = msg->easy_handle;
-      if (curl_easy_getinfo (handle, CURLINFO_PRIVATE, &pstream) == CURLE_OK)
+      /* We actually want to get a void* out of here, but for "for
+	 internal reasons", CURL actually returns a char* and gives a
+	 compiler warning otherwise. */
+      if (curl_easy_getinfo (handle, CURLINFO_PRIVATE, &pstream_) == CURLE_OK)
 	{
+	  pstream = (StreamInstance *) pstream_;
 	  if (!(pstream->status & STREAM_STATUS_ACTIVE))
 	    {
 	      /* Special case for JavaScript that CURL could not handle */
@@ -1749,7 +1764,7 @@ plugin_get_data_types (Plugin *plugin)
   if (plugin->data_types)
     return plugin->data_types;
 
-  gchar *mime_desc = plugin->NP_GetMIMEDescription ();
+  const gchar *mime_desc = plugin->NP_GetMIMEDescription ();
   if (mime_desc == NULL)
     return NULL;
 
@@ -1780,6 +1795,8 @@ plugin_get_data_types (Plugin *plugin)
   return plugin->data_types;
 }
 
+static void plugin_destroy (Plugin *plugin);
+
 static Plugin *
 plugin_new (const gchar *path)
 {
@@ -1788,34 +1805,28 @@ plugin_new (const gchar *path)
     return NULL;
   plugin->path = g_strdup (path);
 
-  if ((plugin->module = g_module_open (path, G_MODULE_BIND_LOCAL)) == NULL)
+  if ((plugin->module = dlopen (path, RTLD_LAZY|RTLD_LOCAL)) == NULL)
     goto error;
 
-  gpointer symbol;
-  if (!g_module_symbol (plugin->module, "NP_Initialize", &symbol))
+  if (!(plugin->NP_Initialize = dlsym (plugin->module, "NP_Initialize")))
     goto error;
-  plugin->NP_Initialize = (NP_InitializeUPP)symbol;
-  if (!g_module_symbol (plugin->module, "NP_Shutdown", &symbol))
+  if (!(plugin->NP_Shutdown = dlsym (plugin->module, "NP_Shutdown")))
     goto error;
-  plugin->NP_Shutdown = (NP_ShutdownUPP)symbol;
-  if (!g_module_symbol (plugin->module, "NP_GetMIMEDescription", &symbol))
+  if (!(plugin->NP_GetMIMEDescription =
+	dlsym (plugin->module, "NP_GetMIMEDescription")))
     goto error;
-  plugin->NP_GetMIMEDescription = (NP_GetMIMEDescriptionUPP)symbol;
-  if (g_module_symbol (plugin->module, "NP_GetValue", &symbol))
-    plugin->NP_GetValue = (NP_GetValueUPP)symbol;
-  if (g_module_symbol (plugin->module, "npw_master_connection", &symbol))
-    plugin->get_master_connection = (rpc_connection_t *(*)(void))symbol;
-  goto do_return;
+  if (!(plugin->NP_GetValue = dlsym (plugin->module, "NP_GetValue")))
+    goto error;
+
+  return plugin;
 
  error:
   if (plugin)
     {
-      g_free (plugin);
+      plugin_destroy (plugin);
       plugin = NULL;
     }
-
-do_return:
-  return plugin;
+  return NULL;
 }
 
 static void
@@ -1826,7 +1837,18 @@ plugin_destroy (Plugin *plugin)
 
   if (plugin->module)
     {
-      g_module_close (plugin->module);
+      /* Intentionally avoid unloading the module. This causes crashes
+       * as some libraries break when you unload them. In particular,
+       * Qt has a bug where it will blow away pthread_key_t 0 on
+       * unload. (In this process, this corresponds to glib's internal
+       * thread data. Everything in glib breaks when this happens)
+       * Sadly, Kopete installs this utterly pointless
+       * "skypebuttons.so" plugin that pulls in Qt while doing almost
+       * nothing else.
+       *
+       * http://bugreports.qt.nokia.com/browse/QTBUG-10861 */
+
+      /* dlclose (plugin->module); */
       plugin->module = NULL;
     }
 
@@ -1954,7 +1976,7 @@ plugin_stop (Plugin *plugin)
       /* A NULL handle means the plugin must not do any graphics operation further */
       plugin->np_window.window = NULL;
 
-      CallNPP_SetWindowProc (plugin->plugin_funcs.setwindow,
+      plugin->plugin_funcs.setwindow(
 			     plugin->instance,
 			     &plugin->np_window);
     }
@@ -2006,24 +2028,33 @@ get_plugin_dirs (void)
 static gboolean
 is_npapi_plugin (const gchar *path)
 {
-  GModule *module = g_module_open (path, G_MODULE_BIND_LOCAL);
+  void *module = dlopen (path, RTLD_LAZY|RTLD_LOCAL);
   if (module == NULL)
     {
       if (g_verbose)
-	npw_printf ("WARNING: %s\n", g_module_error ());
+	npw_printf ("WARNING: %s\n", dlerror ());
       return FALSE;
     }
 
-  gpointer symbol;
   gboolean is_valid = TRUE;
-  if (!g_module_symbol (module, "NP_Initialize", &symbol))
+  if (dlsym (module, "NP_Initialize") == NULL)
     is_valid = FALSE;
-  if (!g_module_symbol (module, "NP_Shutdown", &symbol))
+  if (dlsym (module, "NP_Shutdown") == NULL)
     is_valid = FALSE;
-  if (!g_module_symbol (module, "NP_GetMIMEDescription", &symbol))
+  if (dlsym (module, "NP_GetMIMEDescription") == NULL)
     is_valid = FALSE;
 
-  g_module_close (module);
+  /* Intentionally avoid unloading the module. This causes crashes as
+   * some libraries break when you unload them. In particular, Qt has
+   * a bug where it will blow away pthread_key_t 0 on unload. (In this
+   * process, this corresponds to glib's internal thread
+   * data. Everything in glib breaks when this happens) Sadly, Kopete
+   * installs this utterly pointless "skypebuttons.so" plugin that
+   * pulls in Qt while doing almost nothing else.
+   *
+   * http://bugreports.qt.nokia.com/browse/QTBUG-10861 */
+
+  /* dlclose (module); */
   return is_valid;
 }
 
@@ -2213,6 +2244,7 @@ print_help (const gchar *program_name)
   g_print ("Options:\n");
   g_print ("  -v|--verbose            enable verbose mode\n");
   g_print ("  -f|--fullscreen         start in fullscreen mode\n");
+  g_print ("  --xid N                 embed in window with xid N\n");
   g_print ("\n");
 
   g_print ("Common attributes include:\n");
@@ -2490,6 +2522,14 @@ main (int argc, char *argv[])
 	is_fullscreen = FALSE;
       else if (strcmp (arg, "--fullscreen") == 0)
 	is_fullscreen = TRUE;
+      else if (strcmp (arg, "--xid") == 0)
+        {
+	  if (++i < argc)
+	    {
+	      g_xid = atoi(argv[i]);
+	      npw_printf ("attaching to xid %d\n", g_xid);
+	    }
+        }
       else if (strcmp (arg, "--plugin") == 0)
 	{
 	  if (plugin_desc)
@@ -2581,36 +2621,37 @@ main (int argc, char *argv[])
 
       g_timeout_add (100, (GSourceFunc)player_app_run, app);
 
-      if (TRUE)
-	{
-	  GtkWidget *window = gtk_window_new (GTK_WINDOW_TOPLEVEL);
-	  if ((app->window = window) == NULL)
-	    g_error ("could not create toplevel window");
+      GtkWidget *window;
+      if (g_xid)
+	window = gtk_plug_new ((GdkNativeWindow)g_xid);
+      else
+	window = gtk_window_new (GTK_WINDOW_TOPLEVEL);
+      if ((app->window = window) == NULL)
+	g_error ("could not create toplevel window");
 
-	  gtk_widget_set_size_request (window, display_width, display_height);
-	  gtk_window_set_title (GTK_WINDOW (window), title);
-	  if (is_fullscreen)
-	    gtk_window_fullscreen (GTK_WINDOW (window));
-	  gtk_widget_show (window);
+      gtk_widget_set_size_request (window, display_width, display_height);
+      gtk_window_set_title (GTK_WINDOW (window), title);
+      if (is_fullscreen && !g_xid)
+	gtk_window_fullscreen (GTK_WINDOW (window));
+      gtk_widget_show (window);
 
-	  /* Ensure focus window is this window not gtk's proxy for non XEMBED case */
-	  XWindowAttributes xattrs;
-	  XGetWindowAttributes (GDK_DISPLAY (), GDK_WINDOW_XWINDOW (window->window), &xattrs);
-	  XSelectInput (GDK_DISPLAY (),
-			GDK_WINDOW_XWINDOW (window->window),
-			xattrs.your_event_mask | SubstructureNotifyMask);
-	  gdk_window_add_filter (window->window, on_window_filter_cb, app);
-	  XSync (GDK_DISPLAY (), False);
+      /* Ensure focus window is this window not gtk's proxy for non XEMBED case */
+      XWindowAttributes xattrs;
+      XGetWindowAttributes (GDK_DISPLAY (), GDK_WINDOW_XWINDOW (window->window), &xattrs);
+      XSelectInput (GDK_DISPLAY (),
+		    GDK_WINDOW_XWINDOW (window->window),
+		    xattrs.your_event_mask | SubstructureNotifyMask);
+      gdk_window_add_filter (window->window, on_window_filter_cb, app);
+      XSync (GDK_DISPLAY (), False);
 
-	  g_signal_connect (window, "destroy",
-			    G_CALLBACK (on_window_destroy_cb), NULL);
-	  g_signal_connect (window, "key-press-event",
-			    G_CALLBACK (on_key_press_event_cb), app);
-	  g_signal_connect (window, "configure-event",
-			    G_CALLBACK (on_configure_event_cb), app);
-	  g_signal_connect (window, "window-state-event",
-			    G_CALLBACK (on_window_state_event_cb), app);
-	}
+      g_signal_connect (window, "destroy",
+			G_CALLBACK (on_window_destroy_cb), NULL);
+      g_signal_connect (window, "key-press-event",
+			G_CALLBACK (on_key_press_event_cb), app);
+      g_signal_connect (window, "configure-event",
+			G_CALLBACK (on_configure_event_cb), app);
+      g_signal_connect (window, "window-state-event",
+			G_CALLBACK (on_window_state_event_cb), app);
 
       if (g_backend == BACKEND_GTK)
 	{

@@ -19,6 +19,9 @@
  */
 
 #include "sysdeps.h"
+
+#include <glib.h>
+
 #include "npw-common.h"
 #include "npw-malloc.h"
 
@@ -52,7 +55,7 @@ npw_plugin_instance_ref(void *ptr)
 {
   NPW_PluginInstance *plugin = (NPW_PluginInstance *)ptr;
   if (plugin)
-    plugin->refcount++;
+	g_atomic_int_inc(&plugin->refcount);
   return plugin;
 }
 
@@ -62,8 +65,13 @@ npw_plugin_instance_unref(void *ptr)
   NPW_PluginInstance *plugin = (NPW_PluginInstance *)ptr;
   if (plugin == NULL)
     return;
-  if (--plugin->refcount > 0)
+  if (!g_atomic_int_dec_and_test(&plugin->refcount))
     return;
+  // XXX: This MUST be called on the main thread, to avoid calling
+  // finalize on another thread. For now, this does not happen as
+  // NPN_PluginThreadAsyncCall is the only thing callable off the plugin
+  // thread. Should this change, we will need to post the destroy task
+  // elsewhere or make all finalize hooks thread-safe.
   NPW_PluginInstanceClass *klass = plugin->klass;
   if (klass && klass->finalize)
     klass->finalize (plugin);
@@ -102,41 +110,63 @@ NPW_InitializeFuncs (NPNetscapeFuncs *mozilla_funcs,
 	  MIN (sizeof (g_plugin_funcs), plugin_funcs->size));
 }
 
-void *
+attribute_hidden void *
 NPN_MemAlloc (uint32_t size)
 {
-  return CallNPN_MemAllocProc (g_mozilla_funcs.memalloc, size);
+  return g_mozilla_funcs.memalloc(size);
 }
 
-void
+attribute_hidden void
 NPN_MemFree (void *ptr)
 {
-  CallNPN_MemFreeProc (g_mozilla_funcs.memfree, ptr);
+  g_mozilla_funcs.memfree(ptr);
 }
 
-uint32_t
+attribute_hidden uint32_t
 NPN_MemFlush (uint32_t size)
 {
-  return CallNPN_MemFlushProc (g_mozilla_funcs.memflush, size);
+  return g_mozilla_funcs.memflush(size);
 }
 
-NPObject *
+attribute_hidden NPObject *
+NPN_CreateObject (NPP instance, NPClass *aclass)
+{
+  return g_mozilla_funcs.createobject(instance, aclass);
+}
+
+attribute_hidden NPObject *
 NPN_RetainObject (NPObject *npobj)
 {
-  return CallNPN_RetainObjectProc (g_mozilla_funcs.retainobject, npobj);
+  return g_mozilla_funcs.retainobject(npobj);
 }
 
-void
+void attribute_hidden
 NPN_ReleaseObject (NPObject *npobj)
 {
-  CallNPN_ReleaseObjectProc (g_mozilla_funcs.releaseobject, npobj);
+  g_mozilla_funcs.releaseobject(npobj);
 }
 
-void
+void attribute_hidden
 NPN_ReleaseVariantValue (NPVariant *var)
 {
-  CallNPN_ReleaseVariantValueProc (g_mozilla_funcs.releasevariantvalue, var);
+  g_mozilla_funcs.releasevariantvalue(var);
 }
+
+NPError
+NPW_ReallocData(void *ptr, uint32_t size, void **out)
+{
+  if (ptr == NULL) {
+	*out = NULL;
+	return NPERR_NO_ERROR;
+  }
+  *out = NPN_MemAlloc(size);
+  if (*out == NULL) {
+	return NPERR_OUT_OF_MEMORY_ERROR;
+  }
+  memcpy(*out, ptr, size);
+  return NPERR_NO_ERROR;
+}
+
 
 /* ====================================================================== */
 /* === Identifiers                                                    === */

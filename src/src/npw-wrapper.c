@@ -2,6 +2,7 @@
  *  npw-wrapper.c - Host Mozilla plugin (loads the actual viewer)
  *
  *  nspluginwrapper (C) 2005-2009 Gwenole Beauchesne
+ *                  (C) 2011 David Benjamin
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -150,7 +151,7 @@ static int plugin_killed = 0;
 /* ====================================================================== */
 
 // Flush the X output buffer
-static void toolkit_flush(void)
+static void toolkit_flush(NPP instance)
 {
   // Always prefer gdk_flush() if the master binary is linked against Gtk
   static void (*INVALID)(void) = (void (*)(void))(intptr_t)-1;
@@ -166,9 +167,32 @@ static void toolkit_flush(void)
 
   // Try raw X11
   Display *x_display = NULL;
-  int error = mozilla_funcs.getvalue(NULL, NPNVxDisplay, (void *)&x_display);
+  int error = mozilla_funcs.getvalue(instance, NPNVxDisplay, (void *)&x_display);
   if (error == NPERR_NO_ERROR && x_display) {
 	XSync(x_display, False);
+	return;
+  }
+}
+
+static void pointer_ungrab(NPP instance, Time time)
+{
+  // Always prefer gdk_pointer_ungrab() if the master binary is linked against Gtk
+  static void (*INVALID)(uint32_t) = (void (*)(uint32_t))(intptr_t)-1;
+  static void (*lib_gdk_pointer_ungrab)(uint32_t) = NULL;
+  if (lib_gdk_pointer_ungrab == NULL) {
+	if ((lib_gdk_pointer_ungrab = dlsym(RTLD_DEFAULT, "gdk_pointer_ungrab")) == NULL)
+	  lib_gdk_pointer_ungrab = INVALID;
+  }
+  if (lib_gdk_pointer_ungrab != INVALID) {
+	lib_gdk_pointer_ungrab(time);
+	return;
+  }
+
+  // Try raw X11
+  Display *x_display = NULL;
+  int error = mozilla_funcs.getvalue(instance, NPNVxDisplay, (void *)&x_display);
+  if (error == NPERR_NO_ERROR && x_display) {
+	XUngrabPointer(x_display, time);
 	return;
   }
 }
@@ -224,20 +248,16 @@ static void plugin_instance_invalidate(PluginInstance *plugin)
 static NPPluginFuncs plugin_funcs;
 
 // Allows the browser to query the plug-in supported formats
-typedef char * (*NP_GetMIMEDescriptionUPP)(void);
-static NP_GetMIMEDescriptionUPP g_plugin_NP_GetMIMEDescription = NULL;
+static NP_GetMIMEDescriptionFunc g_plugin_NP_GetMIMEDescription = NULL;
 
 // Allows the browser to query the plug-in for information
-typedef NPError (*NP_GetValueUPP)(void *instance, NPPVariable variable, void *value);
-static NP_GetValueUPP g_plugin_NP_GetValue = NULL;
+static NP_GetValueFunc g_plugin_NP_GetValue = NULL;
 
 // Provides global initialization for a plug-in
-typedef NPError (*NP_InitializeUPP)(NPNetscapeFuncs *moz_funcs, NPPluginFuncs *plugin_funcs);
-static NP_InitializeUPP g_plugin_NP_Initialize = NULL;
+static NP_InitializeFunc g_plugin_NP_Initialize = NULL;
 
 // Provides global deinitialization for a plug-in
-typedef NPError (*NP_ShutdownUPP)(void);
-static NP_ShutdownUPP g_plugin_NP_Shutdown = NULL;
+static NP_ShutdownFunc g_plugin_NP_Shutdown = NULL;
 
 // Plugin native library handle
 static void *plugin_handle = NULL;
@@ -251,25 +271,25 @@ static bool plugin_load_native(void)
 	return false;
   }
   dlerror();
-  g_plugin_NP_GetMIMEDescription = (NP_GetMIMEDescriptionUPP)dlsym(handle, "NP_GetMIMEDescription");
+  g_plugin_NP_GetMIMEDescription = (NP_GetMIMEDescriptionFunc)dlsym(handle, "NP_GetMIMEDescription");
   if ((error = dlerror()) != NULL) {
 	npw_printf("ERROR: %s\n", error);
 	dlclose(handle);
 	return false;
   }
-  g_plugin_NP_Initialize = (NP_InitializeUPP)dlsym(handle, "NP_Initialize");
+  g_plugin_NP_Initialize = (NP_InitializeFunc)dlsym(handle, "NP_Initialize");
   if ((error = dlerror()) != NULL) {
 	npw_printf("ERROR: %s\n", error);
 	dlclose(handle);
 	return false;
   }
-  g_plugin_NP_Shutdown = (NP_ShutdownUPP)dlsym(handle, "NP_Shutdown");
+  g_plugin_NP_Shutdown = (NP_ShutdownFunc)dlsym(handle, "NP_Shutdown");
   if ((error = dlerror()) != NULL) {
 	npw_printf("ERROR: %s\n", error);
 	dlclose(handle);
 	return false;
   }
-  g_plugin_NP_GetValue = (NP_GetValueUPP)dlsym(handle, "NP_GetValue");
+  g_plugin_NP_GetValue = (NP_GetValueFunc)dlsym(handle, "NP_GetValue");
   plugin_handle = handle;
   return true;
 }
@@ -315,25 +335,10 @@ static inline bool plugin_direct_exec(void)
 /* ====================================================================== */
 
 static GSource *g_rpc_source;
-static GPollFD g_rpc_poll_fd;
+static GSource *g_rpc_sync_source;
 static XtInputId xt_rpc_source_id;
+static XtBlockHookId xt_rpc_sync_id;
 rpc_connection_t *g_rpc_connection attribute_hidden = NULL;
-
-static gboolean rpc_event_prepare(GSource *source, gint *timeout)
-{
-  *timeout = -1;
-  return FALSE;
-}
-
-static gboolean rpc_event_check(GSource *source)
-{
-  return rpc_wait_dispatch(g_rpc_connection, 0) > 0;
-}
-
-static gboolean rpc_event_dispatch(GSource *source, GSourceFunc callback, gpointer connection)
-{
-  return rpc_dispatch(connection) != RPC_ERROR_CONNECTION_CLOSED;
-}
 
 
 /* ====================================================================== */
@@ -344,21 +349,21 @@ static gboolean rpc_event_dispatch(GSource *source, GSourceFunc callback, gpoint
 #define NPN_HAS_FEATURE(FEATURE) ((mozilla_funcs.version & 0xff) >= NPVERS_HAS_##FEATURE)
 
 // NPN_MemAlloc
-static inline void *g_NPN_MemAlloc(uint32 size)
+static inline void *g_NPN_MemAlloc(uint32_t size)
 {
-  return CallNPN_MemAllocProc(mozilla_funcs.memalloc, size);
+  return mozilla_funcs.memalloc(size);
 }
 
 // NPN_MemFree
 static inline void g_NPN_MemFree(void* ptr)
 {
-  CallNPN_MemFreeProc(mozilla_funcs.memfree, ptr);
+  mozilla_funcs.memfree(ptr);
 }
 
 // NPN_MemFlush
-static inline uint32 g_NPN_MemFlush(uint32 size)
+static inline uint32_t g_NPN_MemFlush(uint32_t size)
 {
-  return CallNPN_MemFlushProc(mozilla_funcs.memflush, size);
+  return mozilla_funcs.memflush(size);
 }
 
 // NPN_ReloadPlugins
@@ -371,7 +376,7 @@ g_NPN_ReloadPlugins(NPBool reloadPages)
 }
 
 // NPN_GetJavaEnv
-static JRIEnv *
+static void *
 g_NPN_GetJavaEnv(void)
 {
   D(bug("NPN_GetJavaEnv\n"));
@@ -380,7 +385,7 @@ g_NPN_GetJavaEnv(void)
 }
 
 // NPN_GetJavaPeer
-static jref
+static void *
 g_NPN_GetJavaPeer(NPP instance)
 {
   D(bug("NPN_GetJavaPeer instance=%p\n", instance));
@@ -395,7 +400,7 @@ static const char *g_NPN_UserAgent(NPP instance)
 	return NULL;
 
   D(bugiI("NPN_UserAgent instance=%p\n", instance));
-  const char *user_agent = CallNPN_UserAgentProc(mozilla_funcs.uagent, instance);
+  const char *user_agent = mozilla_funcs.uagent(instance);
   D(bugiD("NPN_UserAgent return: '%s'\n", user_agent));
   return user_agent;
 }
@@ -422,7 +427,7 @@ g_NPN_Status(NPP instance, const char *message)
 	return;
 
   D(bugiI("NPN_Status instance=%p, message='%s'\n", instance, message));
-  CallNPN_StatusProc(mozilla_funcs.status, instance, message);
+  mozilla_funcs.status(instance, message);
   D(bugiD("NPN_Status done\n"));
 }
 
@@ -478,25 +483,60 @@ static int handle_NPN_GetValue(rpc_connection_t *connection)
 	return error;
   }
 
+  // Work around a Chromium sort-of bug and check for NULL NPPs. It is
+  // only sort of a bug in that we are doing something our plugin had
+  // never requested. Unfortunately, the existing RPC system makes
+  // detecting this very difficult. So, hack in the checks Chromium
+  // was missing.
+  //
+  // TODO: Either fix bug #13 or remove this when the fix in Chromium
+  // has trickled down to the stable channel.
+  bool valid_instance = true;
+  if (PLUGIN_INSTANCE_NPP(plugin) == NULL) {
+	switch (variable) {
+	case NPNVWindowNPObject:
+	case NPNVPluginElementNPObject:
+	case NPNVprivateModeBool:
+	case NPNVnetscapeWindow:
+	  D(bug("Skipping NPN_GetValue on NULL instance to avoid possible crash.\n"));
+	  valid_instance = false;
+	}
+  }
+
   NPError ret = NPERR_GENERIC_ERROR;
   switch (rpc_type_of_NPNVariable(variable)) {
   case RPC_TYPE_UINT32:
 	{
 	  uint32_t n = 0;
-	  ret = g_NPN_GetValue(PLUGIN_INSTANCE_NPP(plugin), variable, (void *)&n);
+	  if (valid_instance)
+		ret = g_NPN_GetValue(PLUGIN_INSTANCE_NPP(plugin), variable, (void *)&n);
 	  return rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_UINT32, n, RPC_TYPE_INVALID);
 	}
   case RPC_TYPE_BOOLEAN:
 	{
-	  PRBool b = PR_FALSE;
-	  ret = g_NPN_GetValue(PLUGIN_INSTANCE_NPP(plugin), variable, (void *)&b);
+	  NPBool b = FALSE;
+	  if (valid_instance)
+		ret = g_NPN_GetValue(PLUGIN_INSTANCE_NPP(plugin), variable, (void *)&b);
 	  return rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_BOOLEAN, b, RPC_TYPE_INVALID);
+	}
+  case RPC_TYPE_STRING:
+	{
+	  char *str = NULL;
+	  ret = g_NPN_GetValue(PLUGIN_INSTANCE_NPP(plugin), variable, (void *)&str);
+	  error = rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_STRING, str, RPC_TYPE_INVALID);
+	  if (str)
+		NPN_MemFree(str);
+	  return error;
 	}
   case RPC_TYPE_NP_OBJECT:
 	{
 	  NPObject *npobj = NULL;
-	  ret = g_NPN_GetValue(PLUGIN_INSTANCE_NPP(plugin), variable, (void *)&npobj);
-	  return rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_NP_OBJECT, npobj, RPC_TYPE_INVALID);
+	  if (valid_instance)
+		ret = g_NPN_GetValue(PLUGIN_INSTANCE_NPP(plugin), variable, (void *)&npobj);
+	  return rpc_method_send_reply(connection,
+								   RPC_TYPE_INT32, ret,
+								   RPC_TYPE_NP_OBJECT_PASS_REF, npobj,
+								   RPC_TYPE_INVALID);
 	}
   }
 
@@ -533,7 +573,23 @@ static int handle_NPN_SetValue(rpc_connection_t *connection)
 	return error;
   }
 
-  NPError ret = g_NPN_SetValue(PLUGIN_INSTANCE_NPP(plugin), variable, (void *)(uintptr_t)value);
+  NPError ret = NPERR_GENERIC_ERROR;
+
+  // Work around a Chromium sort-of bug and check for NULL NPPs. It is
+  // only sort of a bug in that we are doing something our plugin had
+  // never requested. Unfortunately, the existing RPC system makes
+  // detecting this very difficult. So, hack in the checks Chromium
+  // was missing.
+  //
+  // TODO: Either fix bug #13 or remove this when the fix in Chromium
+  // has trickled down to the stable channel.
+  if (PLUGIN_INSTANCE_NPP(plugin) == NULL) {
+	D(bug("Skipping NPN_SetValue on NULL instance to avoid possible crash.\n"));
+	ret = NPERR_INVALID_INSTANCE_ERROR;
+  } else {
+	ret = g_NPN_SetValue(PLUGIN_INSTANCE_NPP(plugin), variable, (void *)(uintptr_t)value);
+  }
+
   return rpc_method_send_reply(connection, RPC_TYPE_INT32, ret, RPC_TYPE_INVALID);
 }
 
@@ -543,8 +599,12 @@ static void g_NPN_InvalidateRect(NPP instance, NPRect *invalidRect)
   if (mozilla_funcs.invalidaterect == NULL)
 	return;
 
-  D(bugiI("NPN_InvalidateRect instance=%p\n", instance));
-  CallNPN_InvalidateRectProc(mozilla_funcs.invalidaterect, instance, invalidRect);
+  D(bugiI("NPN_InvalidateRect instance=%p "
+		  "rect.top=%d rect.left=%d rect.bottom=%d rect.right=%d\n",
+		  instance,
+		  invalidRect->top, invalidRect->left,
+		  invalidRect->bottom, invalidRect->right));
+  mozilla_funcs.invalidaterect(instance, invalidRect);
   D(bugiD("NPN_InvalidateRect done\n"));
 }
 
@@ -594,7 +654,7 @@ static NPError g_NPN_GetURL(NPP instance, const char *url, const char *target)
 	return NPERR_INVALID_FUNCTABLE_ERROR;
 
   D(bugiI("NPN_GetURL instance=%p, url='%s', target='%s'\n", instance, url, target));
-  NPError ret = CallNPN_GetURLProc(mozilla_funcs.geturl, instance, url, target);
+  NPError ret = mozilla_funcs.geturl(instance, url, target);
   D(bugiD("NPN_GetURL return: %d [%s]\n", ret, string_of_NPError(ret)));
   return ret;
 }
@@ -633,7 +693,7 @@ static NPError g_NPN_GetURLNotify(NPP instance, const char *url, const char *tar
 	return NPERR_INVALID_FUNCTABLE_ERROR;
 
   D(bugiI("NPN_GetURLNotify instance=%p, url='%s', target='%s', notifyData=%p\n", instance, url, target, notifyData));
-  NPError ret = CallNPN_GetURLNotifyProc(mozilla_funcs.geturlnotify, instance, url, target, notifyData);
+  NPError ret = mozilla_funcs.geturlnotify(instance, url, target, notifyData);
   D(bugiD("NPN_GetURLNotify return: %d [%s]\n", ret, string_of_NPError(ret)));
   return ret;
 }
@@ -674,7 +734,7 @@ static NPError g_NPN_PostURL(NPP instance, const char *url, const char *target, 
 	return NPERR_INVALID_FUNCTABLE_ERROR;
 
   D(bugiI("NPN_PostURL instance=%p, url='%s', target='%s', file='%s'\n", instance, url, target, file ? buf : "<raw-data>"));
-  NPError ret = CallNPN_PostURLProc(mozilla_funcs.posturl, instance, url, target, len, buf, file);
+  NPError ret = mozilla_funcs.posturl(instance, url, target, len, buf, file);
   D(bugiD("NPN_PostURL return: %d [%s]\n", ret, string_of_NPError(ret)));
   return ret;
 }
@@ -720,7 +780,7 @@ static NPError g_NPN_PostURLNotify(NPP instance, const char *url, const char *ta
 	return NPERR_INVALID_FUNCTABLE_ERROR;
 
   D(bugiI("NPN_PostURLNotify instance=%p, url='%s', target='%s', file='%s', notifyData=%p\n", instance, url, target, file ? buf : "<raw-data>", notifyData));
-  NPError ret = CallNPN_PostURLNotifyProc(mozilla_funcs.posturlnotify, instance, url, target, len, buf, file, notifyData);
+  NPError ret = mozilla_funcs.posturlnotify(instance, url, target, len, buf, file, notifyData);
   D(bugiD("NPN_PostURLNotify return: %d [%s]\n", ret, string_of_NPError(ret)));
   return ret;
 }
@@ -795,7 +855,7 @@ static NPError g_NPN_RequestRead(NPStream *stream, NPByteRange *rangeList)
 	return NPERR_INVALID_FUNCTABLE_ERROR;
 
   D(bugiI("NPN_RequestRead stream=%p, rangeList=%p\n", stream, rangeList));
-  NPError ret = CallNPN_RequestReadProc(mozilla_funcs.requestread, stream, rangeList);
+  NPError ret = mozilla_funcs.requestread(stream, rangeList);
   D(bugiD("NPN_RequestRead return: %d [%s]\n", ret, string_of_NPError(ret)));
   return ret;
 }
@@ -837,7 +897,7 @@ static NPError g_NPN_NewStream(NPP instance, NPMIMEType type, const char *target
 	return NPERR_INVALID_PARAM;
 
   D(bugiI("NPN_NewStream instance=%p, type='%s', target='%s'\n", instance, type, target));
-  NPError ret = CallNPN_NewStreamProc(mozilla_funcs.newstream, instance, type, target, stream);
+  NPError ret = mozilla_funcs.newstream(instance, type, target, stream);
   D(bugiD("NPN_NewStream return: %d [%s]\n", ret, string_of_NPError(ret)));
 
   if (PLUGIN_DIRECT_EXEC)
@@ -908,7 +968,7 @@ static int handle_NPN_NewStream(rpc_connection_t *connection)
 							   RPC_TYPE_INVALID);
 }
 
-// NPN_DestroySream
+// NPN_DestroyStream
 static NPError
 g_NPN_DestroyStream(NPP instance, NPStream *stream, NPReason reason)
 {
@@ -931,7 +991,7 @@ g_NPN_DestroyStream(NPP instance, NPStream *stream, NPReason reason)
 
   D(bugiI("NPN_DestroyStream instance=%p, stream=%p, reason=%s\n",
 		instance, stream, string_of_NPReason(reason)));
-  NPError ret = CallNPN_DestroyStreamProc(mozilla_funcs.destroystream, instance, stream, reason);
+  NPError ret = mozilla_funcs.destroystream(instance, stream, reason);
   D(bugiD("NPN_DestroyStream return: %d [%s]\n", ret, string_of_NPError(ret)));
 
   return ret;
@@ -960,7 +1020,7 @@ static int handle_NPN_DestroyStream(rpc_connection_t *connection)
 }
 
 // NPN_Write
-static int32 g_NPN_Write(NPP instance, NPStream *stream, int32 len, void *buf)
+static int32_t g_NPN_Write(NPP instance, NPStream *stream, int32_t len, void *buf)
 {
   if (mozilla_funcs.write == NULL)
 	return -1;
@@ -969,7 +1029,7 @@ static int32 g_NPN_Write(NPP instance, NPStream *stream, int32 len, void *buf)
 	return -1;
 
   D(bugiI("NPN_Write instance=%p\n", instance));
-  int32 ret = CallNPN_WriteProc(mozilla_funcs.write, instance, stream, len, buf);
+  int32_t ret = mozilla_funcs.write(instance, stream, len, buf);
   D(bugiD("NPN_Write return: %d\n", ret));
   return ret;
 }
@@ -993,7 +1053,7 @@ static int handle_NPN_Write(rpc_connection_t *connection)
 	return error;
   }
 
-  int32 ret = g_NPN_Write(PLUGIN_INSTANCE_NPP(plugin), stream, len, buf);
+  int32_t ret = g_NPN_Write(PLUGIN_INSTANCE_NPP(plugin), stream, len, buf);
 
   if (buf)
 	free(buf);
@@ -1008,7 +1068,7 @@ static void g_NPN_PushPopupsEnabledState(NPP instance, NPBool enabled)
 	return;
 
   D(bugiI("NPN_PushPopupsEnabledState instance=%p, enabled=%d\n", instance, enabled));
-  CallNPN_PushPopupsEnabledStateProc(mozilla_funcs.pushpopupsenabledstate, instance, enabled);
+  mozilla_funcs.pushpopupsenabledstate(instance, enabled);
   D(bugiD("NPN_PushPopupsEnabledState done\n"));
 }
 
@@ -1040,7 +1100,7 @@ static void g_NPN_PopPopupsEnabledState(NPP instance)
 	return;
 
   D(bugiI("NPN_PopPopupsEnabledState instance=%p\n", instance));
-  CallNPN_PopPopupsEnabledStateProc(mozilla_funcs.poppopupsenabledstate, instance);
+  mozilla_funcs.poppopupsenabledstate(instance);
   D(bugiD("NPN_PopPopupsEnabledState done\n"));
 }
 
@@ -1073,37 +1133,9 @@ static NPObject *
 g_NPN_CreateObject(NPP instance, NPClass *klass)
 {
   D(bugiI("NPN_CreateObject instance=%p, aClass=%p\n", instance, klass));
-  NPObject *npobj = CallNPN_CreateObjectProc(mozilla_funcs.createobject, instance, klass);
+  NPObject *npobj = mozilla_funcs.createobject(instance, klass);
   D(bugiD("NPN_CreateObject return: %p\n", npobj));
   return npobj;
-}
-
-static int handle_NPN_CreateObject(rpc_connection_t *connection)
-{
-  D(bug("handle_NPN_CreateObject\n"));
-
-  PluginInstance *plugin;
-  int error = rpc_method_get_args(connection,
-								  RPC_TYPE_NPW_PLUGIN_INSTANCE, &plugin,
-								  RPC_TYPE_INVALID);
-
-  if (error != RPC_ERROR_NO_ERROR) {
-	npw_perror("NPN_CreateObject() get args", error);
-	return error;
-  }
-
-  NPObject *npobj = g_NPN_CreateObject(PLUGIN_INSTANCE_NPP(plugin), &npclass_bridge);
-
-  uint32_t npobj_id = 0;
-  if (npobj) {
-	NPObjectInfo *npobj_info = npobject_info_new(npobj);
-	if (npobj_info) {
-	  npobj_id = npobj_info->npobj_id;
-	  npobject_associate(npobj, npobj_info);
-	}
-  }
-
-  return rpc_method_send_reply(connection, RPC_TYPE_UINT32, npobj_id, RPC_TYPE_INVALID);
 }
 
 // NPN_RetainObject
@@ -1111,34 +1143,9 @@ static NPObject *
 g_NPN_RetainObject(NPObject *npobj)
 {
   D(bugiI("NPN_RetainObject npobj=%p\n", npobj));
-  NPObject *new_npobj = CallNPN_RetainObjectProc(mozilla_funcs.retainobject, npobj);
+  NPObject *new_npobj = mozilla_funcs.retainobject(npobj);
   D(bugiD("NPN_RetainObject return: %p (refcount: %d)\n", new_npobj, new_npobj->referenceCount));
   return new_npobj;
-}
-
-static int handle_NPN_RetainObject(rpc_connection_t *connection)
-{
-  D(bug("handle_NPN_RetainObject\n"));
-
-  NPObject *npobj;
-  int error = rpc_method_get_args(connection,
-								  RPC_TYPE_NP_OBJECT, &npobj,
-								  RPC_TYPE_INVALID);
-
-  if (error != RPC_ERROR_NO_ERROR) {
-	npw_perror("NPN_RetainObject() get args", error);
-	return error;
-  }
-
-  if (npobj == NULL) // this shall not happen, let it crash
-	npw_printf("ERROR: NPN_RetainObject got a null NPObject\n");
-
-  NPObject *new_npobj = g_NPN_RetainObject(npobj);
-
-  if (new_npobj != npobj)
-	npw_printf("WARNING: NPN_RetainObject() did not return the same object\n");
-
-  return rpc_method_send_reply(connection, RPC_TYPE_UINT32, npobj->referenceCount, RPC_TYPE_INVALID);
 }
 
 // NPN_ReleaseObject
@@ -1151,41 +1158,13 @@ g_NPN_ReleaseObject(NPObject *npobj)
   D(bugiD("NPN_ReleaseObject done (refcount: %d)\n", refcount));
 }
 
-static int handle_NPN_ReleaseObject(rpc_connection_t *connection)
-{
-  D(bug("handle_NPN_ReleaseObject\n"));
-
-  NPObject *npobj;
-  int error = rpc_method_get_args(connection,
-								  RPC_TYPE_NP_OBJECT, &npobj,
-								  RPC_TYPE_INVALID);
-
-  if (error != RPC_ERROR_NO_ERROR) {
-	npw_perror("NPN_ReleaseObject() get args", error);
-	return error;
-  }
-
-  if (npobj == NULL) // this shall not happen, let it crash
-	npw_printf("ERROR: NPN_ReleaseObject got a null NPObject\n");
-
-  /* Decrement reference count here so that we don't depend on a
-   * (possibly) deallocated NPObject afterwards, when we send the
-   * value in the RPC reply
-   */
-  uint32_t refcount = npobj->referenceCount - 1;
-
-  g_NPN_ReleaseObject(npobj);
-
-  return rpc_method_send_reply(connection, RPC_TYPE_UINT32, refcount, RPC_TYPE_INVALID);
-}
-
 // NPN_Invoke
 static bool
 g_NPN_Invoke(NPP instance, NPObject *npobj, NPIdentifier methodName, const NPVariant *args, uint32_t argCount, NPVariant *result)
 {
   D(bugiI("NPN_Invoke instance=%p, npobj=%p, methodName=%p\n", instance, npobj, methodName));
   print_npvariant_args(args, argCount);
-  bool ret = CallNPN_InvokeProc(mozilla_funcs.invoke, instance, npobj, methodName, args, argCount, result);
+  bool ret = mozilla_funcs.invoke(instance, npobj, methodName, args, argCount, result);
   gchar *result_str = string_of_NPVariant(result);
   D(bugiD("NPN_Invoke return: %d (%s)\n", ret, result_str));
   g_free(result_str);
@@ -1217,19 +1196,18 @@ static int handle_NPN_Invoke(rpc_connection_t *connection)
   VOID_TO_NPVARIANT(result);
   bool ret = g_NPN_Invoke(PLUGIN_INSTANCE_NPP(plugin), npobj, methodName, args, argCount, &result);
 
+  if (npobj)
+	NPN_ReleaseObject(npobj);
   if (args) {
 	for (int i = 0; i < argCount; i++)
 	  NPN_ReleaseVariantValue(&args[i]);
 	free(args);
   }
 
-  int rpc_ret = rpc_method_send_reply(connection,
-									  RPC_TYPE_UINT32, ret,
-									  RPC_TYPE_NP_VARIANT, &result,
-									  RPC_TYPE_INVALID);
-
-  NPN_ReleaseVariantValue(&result);
-  return rpc_ret;
+  return rpc_method_send_reply(connection,
+							   RPC_TYPE_UINT32, ret,
+							   RPC_TYPE_NP_VARIANT_PASS_REF, &result,
+							   RPC_TYPE_INVALID);
 }
 
 // NPN_InvokeDefault
@@ -1238,7 +1216,7 @@ g_NPN_InvokeDefault(NPP instance, NPObject *npobj, const NPVariant *args, uint32
 {
   D(bugiI("NPN_InvokeDefault instance=%p, npobj=%p\n", instance, npobj));
   print_npvariant_args(args, argCount);
-  bool ret = CallNPN_InvokeDefaultProc(mozilla_funcs.invokeDefault, instance, npobj, args, argCount, result);
+  bool ret = mozilla_funcs.invokeDefault(instance, npobj, args, argCount, result);
   gchar *result_str = string_of_NPVariant(result);
   D(bugiD("NPN_InvokeDefault return: %d (%s)\n", ret, result_str));
   g_free(result_str);
@@ -1260,7 +1238,7 @@ static int handle_NPN_InvokeDefault(rpc_connection_t *connection)
 								  RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
-	npw_perror("NPN_Invoke() get args", error);
+	npw_perror("NPN_InvokeDefault() get args", error);
 	return error;
   }
 
@@ -1268,19 +1246,18 @@ static int handle_NPN_InvokeDefault(rpc_connection_t *connection)
   VOID_TO_NPVARIANT(result);
   bool ret = g_NPN_InvokeDefault(PLUGIN_INSTANCE_NPP(plugin), npobj, args, argCount, &result);
 
+  if (npobj)
+	NPN_ReleaseObject(npobj);
   if (args) {
 	for (int i = 0; i < argCount; i++)
 	  NPN_ReleaseVariantValue(&args[i]);
 	free(args);
   }
 
-  int rpc_ret = rpc_method_send_reply(connection,
-									  RPC_TYPE_UINT32, ret,
-									  RPC_TYPE_NP_VARIANT, &result,
-									  RPC_TYPE_INVALID);
-
-  NPN_ReleaseVariantValue(&result);
-  return rpc_ret;
+  return rpc_method_send_reply(connection,
+							   RPC_TYPE_UINT32, ret,
+							   RPC_TYPE_NP_VARIANT_PASS_REF, &result,
+							   RPC_TYPE_INVALID);
 }
 
 // NPN_Evaluate
@@ -1288,7 +1265,8 @@ static bool
 g_NPN_Evaluate(NPP instance, NPObject *npobj, NPString *script, NPVariant *result)
 {
   D(bugiI("NPN_Evaluate instance=%p, npobj=%p\n", instance, npobj));
-  bool ret = CallNPN_EvaluateProc(mozilla_funcs.evaluate, instance, npobj, script, result);
+  D(bug("script = '%.*s'\n", script->UTF8Length, script->UTF8Characters));
+  bool ret = mozilla_funcs.evaluate(instance, npobj, script, result);
   gchar *result_str = string_of_NPVariant(result);
   D(bugiD("NPN_Evaluate return: %d (%s)\n", ret, result_str));
   g_free(result_str);
@@ -1317,16 +1295,15 @@ static int handle_NPN_Evaluate(rpc_connection_t *connection)
   VOID_TO_NPVARIANT(result);
   bool ret = g_NPN_Evaluate(PLUGIN_INSTANCE_NPP(plugin), npobj, &script, &result);
 
-  if (script.utf8characters)
-	free((void *)script.utf8characters);
+  if (npobj)
+	NPN_ReleaseObject(npobj);
+  if (script.UTF8Characters)
+	NPN_MemFree((void *)script.UTF8Characters);
 
-  int rpc_ret = rpc_method_send_reply(connection,
-									  RPC_TYPE_UINT32, ret,
-									  RPC_TYPE_NP_VARIANT, &result,
-									  RPC_TYPE_INVALID);
-
-  NPN_ReleaseVariantValue(&result);
-  return rpc_ret;
+  return rpc_method_send_reply(connection,
+							   RPC_TYPE_UINT32, ret,
+							   RPC_TYPE_NP_VARIANT_PASS_REF, &result,
+							   RPC_TYPE_INVALID);
 }
 
 // NPN_GetProperty
@@ -1334,7 +1311,7 @@ static bool
 g_NPN_GetProperty(NPP instance, NPObject *npobj, NPIdentifier propertyName, NPVariant *result)
 {
   D(bugiI("NPN_GetProperty instance=%p, npobj=%p, propertyName=%p\n", instance, npobj, propertyName));
-  bool ret = CallNPN_GetPropertyProc(mozilla_funcs.getproperty, instance, npobj, propertyName, result);
+  bool ret = mozilla_funcs.getproperty(instance, npobj, propertyName, result);
   gchar *result_str = string_of_NPVariant(result);
   D(bugiD("NPN_GetProperty return: %d (%s)\n", ret, result_str));
   g_free(result_str);
@@ -1363,13 +1340,13 @@ static int handle_NPN_GetProperty(rpc_connection_t *connection)
   VOID_TO_NPVARIANT(result);
   bool ret = g_NPN_GetProperty(PLUGIN_INSTANCE_NPP(plugin), npobj, propertyName, &result);
 
-  int rpc_ret = rpc_method_send_reply(connection,
-									  RPC_TYPE_UINT32, ret,
-									  RPC_TYPE_NP_VARIANT, &result,
-									  RPC_TYPE_INVALID);
+  if (npobj)
+	NPN_ReleaseObject(npobj);
 
-  NPN_ReleaseVariantValue(&result);
-  return rpc_ret;
+  return rpc_method_send_reply(connection,
+							   RPC_TYPE_UINT32, ret,
+							   RPC_TYPE_NP_VARIANT_PASS_REF, &result,
+							   RPC_TYPE_INVALID);
 }
 
 // NPN_SetProperty
@@ -1377,7 +1354,7 @@ static bool
 g_NPN_SetProperty(NPP instance, NPObject *npobj, NPIdentifier propertyName, const NPVariant *value)
 {
   D(bugiI("NPN_SetProperty instance=%p, npobj=%p, propertyName=%p\n", instance, npobj, propertyName));
-  bool ret = CallNPN_SetPropertyProc(mozilla_funcs.setproperty, instance, npobj, propertyName, value);
+  bool ret = mozilla_funcs.setproperty(instance, npobj, propertyName, value);
   D(bugiD("NPN_SetProperty return: %d\n", ret));
   return ret;
 }
@@ -1404,6 +1381,8 @@ static int handle_NPN_SetProperty(rpc_connection_t *connection)
 
   bool ret = g_NPN_SetProperty(PLUGIN_INSTANCE_NPP(plugin), npobj, propertyName, &value);
 
+  if (npobj)
+	NPN_ReleaseObject(npobj);
   NPN_ReleaseVariantValue(&value);
 
   return rpc_method_send_reply(connection,
@@ -1416,7 +1395,7 @@ static bool
 g_NPN_RemoveProperty(NPP instance, NPObject *npobj, NPIdentifier propertyName)
 {
   D(bugiI("NPN_RemoveProperty instance=%p, npobj=%p, propertyName=%p\n", instance, npobj, propertyName));
-  bool ret = CallNPN_RemovePropertyProc(mozilla_funcs.removeproperty, instance, npobj, propertyName);
+  bool ret = mozilla_funcs.removeproperty(instance, npobj, propertyName);
   D(bugiD("NPN_RemoveProperty return: %d\n", ret));
   return ret;
 }
@@ -1441,6 +1420,9 @@ static int handle_NPN_RemoveProperty(rpc_connection_t *connection)
 
   bool ret = g_NPN_RemoveProperty(PLUGIN_INSTANCE_NPP(plugin), npobj, propertyName);
 
+  if (npobj)
+	NPN_ReleaseObject(npobj);
+
   return rpc_method_send_reply(connection,
 							   RPC_TYPE_UINT32, ret,
 							   RPC_TYPE_INVALID);
@@ -1451,7 +1433,7 @@ static bool
 g_NPN_HasProperty(NPP instance, NPObject *npobj, NPIdentifier propertyName)
 {
   D(bugiI("NPN_HasProperty instance=%p, npobj=%p, propertyName=%p\n", instance, npobj, propertyName));
-  bool ret = CallNPN_HasPropertyProc(mozilla_funcs.hasproperty, instance, npobj, propertyName);
+  bool ret = mozilla_funcs.hasproperty(instance, npobj, propertyName);
   D(bugiD("NPN_HasProperty return: %d\n", ret));
   return ret;
 }
@@ -1476,6 +1458,9 @@ static int handle_NPN_HasProperty(rpc_connection_t *connection)
 
   bool ret = g_NPN_HasProperty(PLUGIN_INSTANCE_NPP(plugin), npobj, propertyName);
 
+  if (npobj)
+	NPN_ReleaseObject(npobj);
+
   return rpc_method_send_reply(connection,
 							   RPC_TYPE_UINT32, ret,
 							   RPC_TYPE_INVALID);
@@ -1485,8 +1470,8 @@ static int handle_NPN_HasProperty(rpc_connection_t *connection)
 static bool
 g_NPN_HasMethod(NPP instance, NPObject *npobj, NPIdentifier methodName)
 {
-  D(bugiI("NPN_HasMethod instance=%p, npobj=%p, methodName=%p\n", methodName));
-  bool ret = CallNPN_HasMethodProc(mozilla_funcs.hasmethod, instance, npobj, methodName);
+  D(bugiI("NPN_HasMethod instance=%p, npobj=%p, methodName=%p\n", instance, npobj, methodName));
+  bool ret = mozilla_funcs.hasmethod(instance, npobj, methodName);
   D(bugiD("NPN_HasMethod return: %d\n", ret));
   return ret;
 }
@@ -1511,8 +1496,109 @@ static int handle_NPN_HasMethod(rpc_connection_t *connection)
 
   bool ret = g_NPN_HasMethod(PLUGIN_INSTANCE_NPP(plugin), npobj, methodName);
 
+  if (npobj)
+	NPN_ReleaseObject(npobj);
+
   return rpc_method_send_reply(connection,
 							   RPC_TYPE_UINT32, ret,
+							   RPC_TYPE_INVALID);
+}
+
+// NPN_Enumerate
+static bool
+g_NPN_Enumerate(NPP instance, NPObject *npobj, NPIdentifier **identifiers,
+				uint32_t *count)
+{
+  if (mozilla_funcs.enumerate == NULL)
+	return false;
+
+  D(bugiI("NPN_Enumerate instance=%p, npobj=%p\n", instance, npobj));
+  bool ret = mozilla_funcs.enumerate(instance, npobj, identifiers, count);
+  D(bugiD("NPN_Enumerate return: %d\n", ret));
+  return ret;
+}
+
+static int handle_NPN_Enumerate(rpc_connection_t *connection)
+{
+  D(bug("handle_NPN_Enumerate\n"));
+
+  PluginInstance *plugin;
+  NPObject *npobj;
+  int error = rpc_method_get_args(connection,
+								  RPC_TYPE_NPW_PLUGIN_INSTANCE, &plugin,
+								  RPC_TYPE_NP_OBJECT, &npobj,
+								  RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_Enumerate() get args", error);
+	return error;
+  }
+
+  NPIdentifier *identifiers = NULL;
+  uint32_t count = 0;
+  bool ret = g_NPN_Enumerate(PLUGIN_INSTANCE_NPP(plugin), npobj, &identifiers, &count);
+
+  if (npobj)
+	NPN_ReleaseObject(npobj);
+
+  error = rpc_method_send_reply(connection,
+								RPC_TYPE_UINT32, ret,
+								RPC_TYPE_ARRAY, RPC_TYPE_NP_IDENTIFIER, count, identifiers,
+								RPC_TYPE_INVALID);
+  NPN_MemFree(identifiers);
+  return error;
+}
+
+// NPN_Construct
+static bool
+g_NPN_Construct(NPP instance, NPObject *npobj, const NPVariant *args, uint32_t argCount, NPVariant *result)
+{
+  if (mozilla_funcs.construct == NULL)
+	return false;
+
+  D(bugiI("NPN_Construct instance=%p, npobj=%p\n", instance, npobj));
+  print_npvariant_args(args, argCount);
+  bool ret = mozilla_funcs.construct(instance, npobj, args, argCount, result);
+  gchar *result_str = string_of_NPVariant(result);
+  D(bugiD("NPN_Construct return: %d (%s)\n", ret, result_str));
+  g_free(result_str);
+  return ret;
+}
+
+static int handle_NPN_Construct(rpc_connection_t *connection)
+{
+  D(bug("handle_NPN_Construct\n"));
+
+  PluginInstance *plugin;
+  NPObject *npobj;
+  NPVariant *args;
+  uint32_t argCount;
+  int error = rpc_method_get_args(connection,
+								  RPC_TYPE_NPW_PLUGIN_INSTANCE, &plugin,
+								  RPC_TYPE_NP_OBJECT, &npobj,
+								  RPC_TYPE_ARRAY, RPC_TYPE_NP_VARIANT, &argCount, &args,
+								  RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_Construct() get args", error);
+	return error;
+  }
+
+  NPVariant result;
+  VOID_TO_NPVARIANT(result);
+  bool ret = g_NPN_Construct(PLUGIN_INSTANCE_NPP(plugin), npobj, args, argCount, &result);
+
+  if (npobj)
+	NPN_ReleaseObject(npobj);
+  if (args) {
+	for (int i = 0; i < argCount; i++)
+	  NPN_ReleaseVariantValue(&args[i]);
+	free(args);
+  }
+
+  return rpc_method_send_reply(connection,
+							   RPC_TYPE_UINT32, ret,
+							   RPC_TYPE_NP_VARIANT_PASS_REF, &result,
 							   RPC_TYPE_INVALID);
 }
 
@@ -1521,7 +1607,7 @@ static void
 g_NPN_SetException(NPObject *npobj, const char *message)
 {
   D(bugiI("NPN_SetException npobj=%p, message='%s'\n", npobj, message));
-  CallNPN_SetExceptionProc(mozilla_funcs.setexception, npobj, message);
+  mozilla_funcs.setexception(npobj, message);
   D(bugiD("NPN_SetException done\n"));
 }
 
@@ -1543,7 +1629,10 @@ static int handle_NPN_SetException(rpc_connection_t *connection)
 
   g_NPN_SetException(npobj, message);
 
-  // XXX memory leak (message)
+  if (npobj)
+	NPN_ReleaseObject(npobj);
+  if (message)
+	free(message);
 
   return rpc_method_send_reply (connection, RPC_TYPE_INVALID);
 }
@@ -1553,7 +1642,7 @@ static NPIdentifier
 g_NPN_GetStringIdentifier(const char *name)
 {
   D(bugiI("NPN_GetStringIdentifier name='%s'\n", name));
-  NPIdentifier ident = CallNPN_GetStringIdentifierProc(mozilla_funcs.getstringidentifier, name);
+  NPIdentifier ident = mozilla_funcs.getstringidentifier(name);
   D(bugiD("NPN_GetStringIdentifier return: %p\n", ident));
   return ident;
 }
@@ -1578,16 +1667,16 @@ static int handle_NPN_GetStringIdentifier(rpc_connection_t *connection)
 	free(name);
 
   return rpc_method_send_reply(connection,
-							   RPC_TYPE_NP_IDENTIFIER, ident,
+							   RPC_TYPE_NP_IDENTIFIER, &ident,
 							   RPC_TYPE_INVALID);
 }
 
 // NPN_GetStringIdentifiers
 static void
-g_NPN_GetStringIdentifiers(const NPUTF8 **names, uint32_t nameCount, NPIdentifier *idents)
+g_NPN_GetStringIdentifiers(const NPUTF8 **names, int32_t nameCount, NPIdentifier *idents)
 {
   D(bugiI("NPN_GetStringIdentifiers nameCount=%d\n", nameCount));
-  CallNPN_GetStringIdentifiersProc(mozilla_funcs.getstringidentifiers, names, nameCount, idents);
+  mozilla_funcs.getstringidentifiers(names, nameCount, idents);
   D(bugiD("NPN_GetStringIdentifiers done\n"));
 }
 
@@ -1596,7 +1685,7 @@ static int handle_NPN_GetStringIdentifiers(rpc_connection_t *connection)
   D(bug("handle_NPN_GetStringIdentifiers\n"));
 
   NPUTF8 **names;
-  uint32_t nameCount;
+  int32_t nameCount;
   int error = rpc_method_get_args(connection,
 								  RPC_TYPE_ARRAY, RPC_TYPE_STRING, &nameCount, &names,
 								  RPC_TYPE_INVALID);
@@ -1629,7 +1718,7 @@ static NPIdentifier
 g_NPN_GetIntIdentifier(int32_t intid)
 {
   D(bugiI("NPN_GetIntIdentifier intid=%d\n", intid));
-  NPIdentifier ident = CallNPN_GetIntIdentifierProc(mozilla_funcs.getintidentifier, intid);
+  NPIdentifier ident = mozilla_funcs.getintidentifier(intid);
   D(bugiD("NPN_GetIntIdentifier return: %p\n", ident));
   return ident;
 }
@@ -1651,7 +1740,7 @@ static int handle_NPN_GetIntIdentifier(rpc_connection_t *connection)
   NPIdentifier ident = g_NPN_GetIntIdentifier(intid);
 
   return rpc_method_send_reply(connection,
-							   RPC_TYPE_NP_IDENTIFIER, ident,
+							   RPC_TYPE_NP_IDENTIFIER, &ident,
 							   RPC_TYPE_INVALID);
 }
 
@@ -1660,7 +1749,7 @@ static bool
 g_NPN_IdentifierIsString(NPIdentifier ident)
 {
   D(bugiI("NPN_IdentifierIsString ident=%p\n", ident));
-  bool ret = CallNPN_IdentifierIsStringProc(mozilla_funcs.identifierisstring, ident);
+  bool ret = mozilla_funcs.identifierisstring(ident);
   D(bugiD("NPN_IdentifierIsString return: %s\n", ret ? "true" : "false"));
   return ret;
 }
@@ -1691,7 +1780,7 @@ static NPUTF8 *
 g_NPN_UTF8FromIdentifier(NPIdentifier ident)
 {
   D(bugiI("NPN_UTF8FromIdentifier ident=%p\n", ident));
-  NPUTF8 *str = CallNPN_UTF8FromIdentifierProc(mozilla_funcs.utf8fromidentifier, ident);
+  NPUTF8 *str = mozilla_funcs.utf8fromidentifier(ident);
   D(bugiD("NPN_UTF8FromIdentifier return: '%s'\n", str));
   return str;
 }
@@ -1727,7 +1816,7 @@ static int32_t
 g_NPN_IntFromIdentifier(NPIdentifier ident)
 {
   D(bugiI("NPN_IntFromIdentifier ident=%p\n", ident));
-  int32_t ret = CallNPN_IntFromIdentifierProc(mozilla_funcs.intfromidentifier, ident);
+  int32_t ret = mozilla_funcs.intfromidentifier(ident);
   D(bugiD("NPN_IntFromIdentifier return: %d\n", ret));
   return ret;
 }
@@ -1760,6 +1849,218 @@ g_NPN_ReleaseVariantValue(NPVariant *variant)
   D(bugiI("NPN_ReleaseVariantValue\n"));
   NPN_ReleaseVariantValue(variant);
   D(bugiD("NPN_ReleaseVariantValue done\n"));
+}
+
+// NPN_PluginThreadAsyncCall
+static void
+g_NPN_PluginThreadAsyncCall(NPP instance,
+							void (*func)(void *),
+							void *userData)
+{
+  // No debug statements as the debug system is not thread-safe.
+  mozilla_funcs.pluginthreadasynccall(instance, func, userData);
+}
+
+// NPN_GetValueForURL
+static NPError
+g_NPN_GetValueForURL(NPP instance, NPNURLVariable variable,
+					 const char *url, char **value,
+					 uint32_t *len)
+{
+  if (mozilla_funcs.getvalueforurl == NULL)
+	return NPERR_INVALID_FUNCTABLE_ERROR;
+
+  D(bugiI("NPN_GetValueForURL instance=%p, variable=%d [%s], url=%s\n",
+		  instance, variable, string_of_NPNURLVariable(variable), url));
+  NPError ret = mozilla_funcs.getvalueforurl(instance, variable, url, value, len);
+  D(bugiD("NPN_GetValueForURL return: %d [%s] len=%d\n",
+		  ret, string_of_NPError(ret), *len));
+  return ret;
+}
+
+static int handle_NPN_GetValueForURL(rpc_connection_t *connection)
+{
+  D(bug("handle_NPN_GetValueForURL\n"));
+
+  PluginInstance *plugin;
+  uint32_t variable;
+  char *url;
+  int error = rpc_method_get_args(connection,
+								  RPC_TYPE_NPW_PLUGIN_INSTANCE, &plugin,
+								  RPC_TYPE_UINT32, &variable,
+								  RPC_TYPE_STRING, &url,
+								  RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_GetValueForURL() get args", error);
+	return error;
+  }
+
+  char *value = NULL;
+  uint32_t len = 0;
+  int32_t ret = g_NPN_GetValueForURL(PLUGIN_INSTANCE_NPP(plugin), variable,
+									 url, &value, &len);
+
+  if (url)
+	free(url);
+
+  error = rpc_method_send_reply(connection,
+								RPC_TYPE_INT32, ret,
+								RPC_TYPE_ARRAY, RPC_TYPE_CHAR, len, value,
+								RPC_TYPE_INVALID);
+  NPN_MemFree(value);
+  return error;
+}
+
+// NPN_SetValueForURL
+static NPError
+g_NPN_SetValueForURL(NPP instance, NPNURLVariable variable,
+					 const char *url, const char *value,
+					 uint32_t len)
+{
+  if (mozilla_funcs.setvalueforurl == NULL)
+	return NPERR_INVALID_FUNCTABLE_ERROR;
+
+  D(bugiI("NPN_SetValueForURL instance=%p, variable=%d [%s], url=%s, len=%d\n",
+		  instance, variable, string_of_NPNURLVariable(variable), url, len));
+  NPError ret = mozilla_funcs.setvalueforurl(instance, variable, url, value, len);
+  D(bugiD("NPN_SetValueForURL return: %d [%s]\n", ret, string_of_NPError(ret)));
+  return ret;
+}
+
+static int handle_NPN_SetValueForURL(rpc_connection_t *connection)
+{
+  D(bug("handle_NPN_SetValueForURL\n"));
+
+  PluginInstance *plugin;
+  char *url;
+  uint32_t variable;
+  char *value;
+  uint32_t len;
+  int error = rpc_method_get_args(connection,
+								  RPC_TYPE_NPW_PLUGIN_INSTANCE, &plugin,
+								  RPC_TYPE_UINT32, &variable,
+								  RPC_TYPE_STRING, &url,
+								  RPC_TYPE_ARRAY, RPC_TYPE_CHAR, &len, &value,
+								  RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_SetValueForURL() get args", error);
+	return error;
+  }
+
+  int32_t ret = g_NPN_SetValueForURL(PLUGIN_INSTANCE_NPP(plugin), variable,
+									 url, value, len);
+
+  if (url)
+	free(url);
+  if (value)
+	free(value);
+
+  return rpc_method_send_reply(connection,
+							   RPC_TYPE_INT32, ret,
+							   RPC_TYPE_INVALID);
+}
+
+// NPN_GetAuthenticationInfo
+static NPError
+g_NPN_GetAuthenticationInfo(NPP instance, const char *protocol,
+							const char *host, int32_t port, const char *scheme,
+							const char *realm,
+							char **username, uint32_t *ulen,
+							char **password, uint32_t *plen)
+{
+  if (mozilla_funcs.getauthenticationinfo == NULL)
+	return NPERR_INVALID_FUNCTABLE_ERROR;
+
+  D(bugiI("NPN_GetAuthenticationInfo instance=%p, protocol=%s,"
+		  " host=%s, port=%d, scheme=%s, realm=%s\n",
+		  instance, protocol, host, port, scheme, realm));
+  NPError ret = mozilla_funcs.getauthenticationinfo(instance, protocol, host,
+													port, scheme, realm,
+													username, ulen,
+													password, plen);
+  D(bugiD("NPN_GetAuthenticationInfo return: %d [%s] ulen=%d, plen=%d\n",
+		  ret, string_of_NPError(ret), *ulen, *plen));
+  return ret;
+}
+
+static int handle_NPN_GetAuthenticationInfo(rpc_connection_t *connection)
+{
+  D(bug("handle_NPN_GetAuthenticationInfo\n"));
+
+  PluginInstance *plugin;
+  char *protocol, *host;
+  int32_t port;
+  char *scheme, *realm;
+  int error = rpc_method_get_args(connection,
+								  RPC_TYPE_NPW_PLUGIN_INSTANCE, &plugin,
+								  RPC_TYPE_STRING, &protocol,
+								  RPC_TYPE_STRING, &host,
+								  RPC_TYPE_INT32, &port,
+								  RPC_TYPE_STRING, &scheme,
+								  RPC_TYPE_STRING, &realm,
+								  RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPN_GetAuthenticationInfo() get args", error);
+	return error;
+  }
+
+  char *username = NULL, *password = NULL;
+  uint32_t ulen = 0, plen = 0;
+  int32_t ret = g_NPN_GetAuthenticationInfo(PLUGIN_INSTANCE_NPP(plugin),
+											protocol, host, port, scheme, realm,
+											&username, &ulen, &password, &plen);
+
+  if (protocol)
+	free(protocol);
+  if (host)
+	free(host);
+  if (scheme)
+	free(scheme);
+  if (realm)
+	free(realm);
+
+  error = rpc_method_send_reply(connection,
+								RPC_TYPE_INT32, ret,
+								RPC_TYPE_ARRAY, RPC_TYPE_CHAR, ulen, username,
+								RPC_TYPE_ARRAY, RPC_TYPE_CHAR, plen, password,
+								RPC_TYPE_INVALID);
+
+  if (username)
+	NPN_MemFree(username);
+  if (password)
+	NPN_MemFree(password);
+
+  return error;
+}
+
+// NPN_ScheduleTimer
+static uint32_t
+g_NPN_ScheduleTimer(NPP instance, uint32_t interval, NPBool repeat,
+					void (*timerFunc)(NPP npp, uint32_t timerID))
+{
+  if (mozilla_funcs.scheduletimer == NULL)
+	return 0;
+
+  D(bugiI("NPN_ScheduleTimer instance=%p, interval=%d, repeat=%d\n",
+		  instance, interval, repeat));
+  uint32_t ret = mozilla_funcs.scheduletimer(instance, interval, repeat, timerFunc);
+  D(bugiD("NPN_ScheduleTimer return: %d\n", ret));
+  return ret;
+}
+
+// NPN_UnscheduleTimer
+static void
+g_NPN_UnscheduleTimer(NPP instance, uint32_t timerID)
+{
+  if (mozilla_funcs.unscheduletimer == NULL)
+	return;
+
+  D(bugiI("NPN_UnscheduleTimer instance=%p, timerID=%d\n", instance, timerID));
+  mozilla_funcs.unscheduletimer(instance, timerID);
+  D(bugiD("NPN_UnscheduleTimer done\n"));
 }
 
 
@@ -2001,14 +2302,11 @@ invoke_NPP_GetValue(PluginInstance *plugin, NPPVariable variable, void *value)
 	  switch (variable) {
 	  case NPPVformValue:
 		// this is a '\0'-terminated UTF-8 string data allocated by NPN_MemAlloc()
-		if (ret == NPERR_NO_ERROR && str) {
-		  char *utf8_str = g_NPN_MemAlloc(strlen(str) + 1);
-		  if (utf8_str == NULL)
-			ret = NPERR_OUT_OF_MEMORY_ERROR;
-		  else
-			strcpy(utf8_str, str);
+		if (ret == NPERR_NO_ERROR) {
+		  char *npn_str = NULL;
+		  ret = NPW_ReallocData(str, strlen(str) + 1, (void**)&npn_str);
 		  free(str);
-		  str = utf8_str;
+		  str = npn_str;
 		}
 		break;
 	  default:
@@ -2039,19 +2337,23 @@ invoke_NPP_GetValue(PluginInstance *plugin, NPPVariable variable, void *value)
 		ret = NPERR_GENERIC_ERROR;
 	  }
 	  D(bug("-> value: %s\n", b ? "true" : "false"));
-	  *((PRBool *)value) = b ? PR_TRUE : PR_FALSE;
+	  *((NPBool *)value) = b ? TRUE : FALSE;
 	  break;
 	}
   case RPC_TYPE_NP_OBJECT:
 	{
 	  NPObject *npobj = NULL;
-	  error = rpc_method_wait_for_reply(plugin->connection, RPC_TYPE_INT32, &ret, RPC_TYPE_NP_OBJECT, &npobj, RPC_TYPE_INVALID);
+	  error = rpc_method_wait_for_reply(plugin->connection,
+										RPC_TYPE_INT32, &ret,
+										RPC_TYPE_NP_OBJECT_PASS_REF, &npobj,
+										RPC_TYPE_INVALID);
 	  if (error != RPC_ERROR_NO_ERROR) {
 		npw_perror("NPP_GetValue() wait for reply", error);
 		ret = NPERR_GENERIC_ERROR;
 	  }
 	  D(bug("-> value: <object %p>\n", npobj));
 	  *((NPObject **)value) = npobj;
+	  // Caller is responsible for releasing reference.
 	  break;
 	}
   }
@@ -2062,6 +2364,24 @@ invoke_NPP_GetValue(PluginInstance *plugin, NPPVariable variable, void *value)
 static NPError
 g_NPP_GetValue(NPP instance, NPPVariable variable, void *value)
 {
+  // Firefox sometimes requests NP_GetValue values with NPP_GetValue
+  // for some reason. Notably it requests NPPVpluginDescriptionString
+  // with it when determining whether or not to apply a Flash-specific quirk.
+  //
+  // XXX: The more correct way to fix this may be to accept an NPP
+  // with NULL pdata and let the plugin decide whether to crash or
+  // not. Unfortunately, we get the connection out of the PluginInstance on
+  // the wrapper side, so it's best to avoid a NULL instance
+  // here. This way also avoids extra IPC.
+  if (variable == NPPVpluginNameString || variable == NPPVpluginDescriptionString) {
+	D(bugiI("NPP_GetValue instance=%p, variable=%d [%s]\n",
+			instance, variable, string_of_NPPVariable(variable)));
+	npw_printf("WARNING: browser requested NP_GetValue variable via NPP_GetValue.\n");
+	NPError ret = NP_GetValue(NULL, variable, value);
+	D(bugiD("NPP_GetValue return: %d [%s]\n", ret, string_of_NPError(ret)));
+	return ret;
+  }
+
   if (instance == NULL)
 	return NPERR_INVALID_INSTANCE_ERROR;
 
@@ -2076,7 +2396,7 @@ g_NPP_GetValue(NPP instance, NPPVariable variable, void *value)
   case RPC_TYPE_NP_OBJECT:
 	break;
   default:
-	npw_printf("WARNING: unhandled variable %d in NPP_GetValue()\n", variable);
+	D(bug("WARNING: unhandled variable %d in NPP_GetValue()\n", variable));
 	return NPERR_INVALID_PARAM;
   }
 
@@ -2088,7 +2408,7 @@ g_NPP_GetValue(NPP instance, NPPVariable variable, void *value)
 
 // Sets information about the plug-in
 static NPError
-invoke_NPP_SetValue(PluginInstance *plugin, NPPVariable variable, void *value)
+invoke_NPP_SetValue(PluginInstance *plugin, NPNVariable variable, void *value)
 {
   NPW_UNIMPLEMENTED();
 
@@ -2096,7 +2416,7 @@ invoke_NPP_SetValue(PluginInstance *plugin, NPPVariable variable, void *value)
 }
 
 static NPError
-g_NPP_SetValue(NPP instance, NPPVariable variable, void *value)
+g_NPP_SetValue(NPP instance, NPNVariable variable, void *value)
 {
   if (instance == NULL)
 	return NPERR_INVALID_INSTANCE_ERROR;
@@ -2158,7 +2478,7 @@ g_NPP_URLNotify(NPP instance, const char *url, NPReason reason, void *notifyData
 
 // Notifies a plug-in instance of a new data stream
 static NPError
-invoke_NPP_NewStream(PluginInstance *plugin, NPMIMEType type, NPStream *stream, NPBool seekable, uint16 *stype)
+invoke_NPP_NewStream(PluginInstance *plugin, NPMIMEType type, NPStream *stream, NPBool seekable, uint16_t *stype)
 {
   if (PLUGIN_DIRECT_EXEC)
 	return plugin_funcs.newstream(plugin->native_instance, type, stream, seekable, stype);
@@ -2202,7 +2522,7 @@ invoke_NPP_NewStream(PluginInstance *plugin, NPMIMEType type, NPStream *stream, 
 }
 
 static NPError
-g_NPP_NewStream(NPP instance, NPMIMEType type, NPStream *stream, NPBool seekable, uint16 *stype)
+g_NPP_NewStream(NPP instance, NPMIMEType type, NPStream *stream, NPBool seekable, uint16_t *stype)
 {
   if (instance == NULL)
 	return NPERR_INVALID_INSTANCE_ERROR;
@@ -2334,7 +2654,7 @@ g_NPP_StreamAsFile(NPP instance, NPStream *stream, const char *fname)
 }
 
 // Determines maximum number of bytes that the plug-in can consume
-static int32
+static int32_t
 invoke_NPP_WriteReady(PluginInstance *plugin, NPStream *stream)
 {
   if (PLUGIN_DIRECT_EXEC)
@@ -2367,7 +2687,7 @@ invoke_NPP_WriteReady(PluginInstance *plugin, NPStream *stream)
   return ret;
 }
 
-static int32
+static int32_t
 g_NPP_WriteReady(NPP instance, NPStream *stream)
 {
   if (instance == NULL)
@@ -2378,15 +2698,15 @@ g_NPP_WriteReady(NPP instance, NPStream *stream)
 	return 0;
 
   D(bugiI("NPP_WriteReady instance=%p\n", instance));
-  int32 ret = invoke_NPP_WriteReady(plugin, stream);
+  int32_t ret = invoke_NPP_WriteReady(plugin, stream);
   D(bugiD("NPP_WriteReady return: %d\n", ret));
   return ret;
 }
 
 
 // Delivers data to a plug-in instance
-static int32
-invoke_NPP_Write(PluginInstance *plugin, NPStream *stream, int32 offset, int32 len, void *buf)
+static int32_t
+invoke_NPP_Write(PluginInstance *plugin, NPStream *stream, int32_t offset, int32_t len, void *buf)
 {
   if (PLUGIN_DIRECT_EXEC)
 	return plugin_funcs.write(plugin->native_instance, stream, offset, len, buf);
@@ -2419,8 +2739,8 @@ invoke_NPP_Write(PluginInstance *plugin, NPStream *stream, int32 offset, int32 l
   return ret;
 }
 
-static int32
-g_NPP_Write(NPP instance, NPStream *stream, int32 offset, int32 len, void *buf)
+static int32_t
+g_NPP_Write(NPP instance, NPStream *stream, int32_t offset, int32_t len, void *buf)
 {
   if (instance == NULL)
 	return -1;
@@ -2448,7 +2768,7 @@ g_NPP_Write(NPP instance, NPStream *stream, int32 offset, int32 len, void *buf)
 	buf = NULL;
 
   D(bugiI("NPP_Write instance=%p\n", instance));
-  int32 ret = invoke_NPP_Write(plugin, stream, offset, len, buf);
+  int32_t ret = invoke_NPP_Write(plugin, stream, offset, len, buf);
   D(bugiD("NPP_Write return: %d\n", ret));
   return ret;
 }
@@ -2471,7 +2791,7 @@ static void invoke_NPP_Print(PluginInstance *plugin, NPPrint *PrintInfo)
 	platformPrint = PrintInfo->print.embedPrint.platformPrint;
 	break;
   default:
-	npw_printf("WARNING: PrintInfo mode %d is not supported\n", PrintInfo->mode);
+	D(bug("WARNING: PrintInfo mode %d is not supported\n", PrintInfo->mode));
 	return;
   }
   uint32_t platform_print_id = 0;
@@ -2529,7 +2849,7 @@ static void g_NPP_Print(NPP instance, NPPrint *PrintInfo)
 }
 
 // Delivers a platform-specific window event to the instance
-static int16 invoke_NPP_HandleEvent(PluginInstance *plugin, void *event)
+static int16_t invoke_NPP_HandleEvent(PluginInstance *plugin, void *event)
 {
   if (PLUGIN_DIRECT_EXEC)
 	return plugin_funcs.event(plugin->native_instance, event);
@@ -2560,7 +2880,7 @@ static int16 invoke_NPP_HandleEvent(PluginInstance *plugin, void *event)
   return ret;
 }
 
-static int16 g_NPP_HandleEvent(NPP instance, void *event)
+static int16_t g_NPP_HandleEvent(NPP instance, void *event)
 {
   if (instance == NULL)
 	return NPERR_INVALID_INSTANCE_ERROR;
@@ -2569,15 +2889,134 @@ static int16 g_NPP_HandleEvent(NPP instance, void *event)
   if (plugin == NULL)
 	return NPERR_INVALID_INSTANCE_ERROR;
 
-  if (((NPEvent *)event)->type == GraphicsExpose) {
+  NPEvent *npevent = event;
+  if (npevent->type == GraphicsExpose) {
 	/* XXX: flush the X output buffer so that the call to
 	   gdk_pixmap_foreign_new() in the viewer can work */
-	toolkit_flush();
+	toolkit_flush(instance);
+  }
+
+  if (npevent->type == ButtonPress) {
+	// Release any implicit passive grabs we have so Flash can show a
+	// menu. This is only relevant if your browser does not do
+	// out-of-process plugins. Otherwise, we need the browser to do it
+	// instead.
+	pointer_ungrab(instance, npevent->xbutton.time);
+	toolkit_flush(instance);
   }
 
   D(bugiI("NPP_HandleEvent instance=%p\n", instance));
-  int16 ret = invoke_NPP_HandleEvent(plugin, event);
+  int16_t ret = invoke_NPP_HandleEvent(plugin, event);
   D(bugiD("NPP_HandleEvent return: %d\n", ret));
+  return ret;
+}
+
+// Clears site-data stored by the plug-in
+static NPError
+invoke_NPP_ClearSiteData(const char* site, uint64_t flags, uint64_t maxAge)
+{
+  if (PLUGIN_DIRECT_EXEC)
+	return plugin_funcs.clearsitedata(site, flags, maxAge);
+
+  npw_return_val_if_fail(rpc_method_invoke_possible(g_rpc_connection),
+						 NPERR_GENERIC_ERROR);
+
+  int error = rpc_method_invoke(g_rpc_connection,
+								RPC_METHOD_NPP_CLEAR_SITE_DATA,
+								RPC_TYPE_STRING, site,
+								RPC_TYPE_UINT64, flags,
+								RPC_TYPE_UINT64, maxAge,
+								RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPP_ClearSiteData() invoke", error);
+	return NPERR_GENERIC_ERROR;
+  }
+
+  int32_t ret;
+  error = rpc_method_wait_for_reply(g_rpc_connection,
+									RPC_TYPE_INT32, &ret,
+									RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPP_ClearSiteData() wait for reply", error);
+	return NPERR_GENERIC_ERROR;
+  }
+
+  return ret;
+}
+
+static NPError
+g_NPP_ClearSiteData(const char* site, uint64_t flags, uint64_t maxAge)
+{
+  D(bugiI("NPP_ClearSiteData site=%s, flags=%" G_GUINT64_FORMAT
+		  ", maxAge=%" G_GUINT64_FORMAT "\n",
+		  site ? site : "<null>", flags, maxAge));
+  NPError ret = invoke_NPP_ClearSiteData(site, flags, maxAge);
+  D(bugiD("NPP_ClearSiteData return: %d [%s]\n", ret, string_of_NPError(ret)));
+  return ret;
+}
+
+// Get sites with data stored by the plug-in
+static char **
+invoke_NPP_GetSitesWithData(void)
+{
+  if (PLUGIN_DIRECT_EXEC)
+	return plugin_funcs.getsiteswithdata();
+
+  npw_return_val_if_fail(rpc_method_invoke_possible(g_rpc_connection), NULL);
+
+  int error = rpc_method_invoke(g_rpc_connection,
+								RPC_METHOD_NPP_GET_SITES_WITH_DATA,
+								RPC_TYPE_INVALID);
+
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPP_GetSitesWithData() invoke", error);
+	return NULL;
+  }
+
+  char **sites = NULL;
+  uint32_t siteCount = 0;
+  error = rpc_method_wait_for_reply(g_rpc_connection,
+									RPC_TYPE_ARRAY, RPC_TYPE_STRING,
+									&siteCount, &sites,
+									RPC_TYPE_INVALID);
+  if (error != RPC_ERROR_NO_ERROR) {
+	npw_perror("NPP_GetSitesWithData() wait for reply", error);
+	return NULL;
+  }
+
+  // Convert this to the format NPAPI wants... ugh.
+  char **sites_ret = NULL;
+  if (siteCount > 0) {
+	sites_ret = NPN_MemAlloc(sizeof(char*) * (siteCount+1));
+	if (sites_ret) {
+	  for (int i = 0; i < siteCount; i++) {
+		// Ignore allocation failures here.
+		NPW_ReallocData(sites[i], strlen(sites[i]), (void**)&sites_ret[i]);
+	  }
+	  sites_ret[siteCount] = NULL;
+	}
+  }
+
+  // Delete the other copy.
+  if (sites) {
+	for (int i = 0; i < siteCount; i++) {
+	  free(sites[i]);
+	}
+	free(sites);
+  }
+
+  return sites_ret;
+}
+
+static char **
+g_NPP_GetSitesWithData(void)
+{
+  D(bugiI("NPP_GetSitesWithData\n"));
+  char **ret = invoke_NPP_GetSitesWithData();
+  D(bugiD("NPP_GetSitesWithData return: %d sites\n",
+		  ret ? g_strv_length(ret) : 0));
   return ret;
 }
 
@@ -2638,7 +3077,7 @@ NP_GetValue(void *future, NPPVariable variable, void *value)
 }
 
 // Allows the browser to query the plug-in supported formats
-static char *
+static const char *
 g_NP_GetMIMEDescription(void)
 {
   if (g_plugin.initialized == 0)
@@ -2655,11 +3094,11 @@ g_NP_GetMIMEDescription(void)
   return g_plugin.formats;
 }
 
-char *
+const char *
 NP_GetMIMEDescription(void)
 {
   D(bugiI("NP_GetMIMEDescription\n"));
-  char *formats = g_NP_GetMIMEDescription();
+  const char *formats = g_NP_GetMIMEDescription();
   D(bugiD("NP_GetMIMEDescription return: '%s'\n", formats));
   return formats;
 }
@@ -2727,8 +3166,8 @@ typedef struct _LONG64_NPStream {
   void*  pdata;
   void*  ndata;
   const  char* url;
-  uint64 end;
-  uint64 lastmodified;
+  uint64_t end;
+  uint64_t lastmodified;
   void*  notifyData;
   const  char* headers;
 } LONG64_NPStream;
@@ -2756,14 +3195,14 @@ static inline NPStream *get_stream32(LONG64_NPStream *stream64)
 
 // NPByteRange
 typedef struct _LONG64_NPByteRange {
-  int64  offset;
-  uint64 length;
+  int64_t  offset;
+  uint64_t length;
   struct _LONG64_NPByteRange* next;
 } LONG64_NPByteRange;
 
 // NPSavedData
 typedef struct _LONG64_NPSavedData {
-  int64	len;
+  int64_t	len;
   void*	buf;
 } LONG64_NPSavedData;
 
@@ -2781,7 +3220,7 @@ static void convert_from_NPSavedData(LONG64_NPSavedData *ptr64, const NPSavedDat
 
 // NPSetWindowCallbackStruct
 typedef struct {
-  int64        type;
+  int64_t      type;
 #ifdef MOZ_X11
   Display*     display;
   Visual*      visual;
@@ -2817,7 +3256,7 @@ static void convert_from_LONG64_NPSetWindowCallbackStruct(NPSetWindowCallbackStr
 
 // NPPrintCallbackStruct
 typedef struct {
-  int64 type;
+  int64_t type;
   FILE* fp;
 } LONG64_NPPrintCallbackStruct;
 
@@ -2841,10 +3280,10 @@ static void convert_from_LONG64_NPPrintCallbackStruct(NPPrintCallbackStruct *ptr
 // NPWindow
 typedef struct _LONG64_NPWindow {
   void* window;
-  int64 x;
-  int64 y;
-  uint64 width;
-  uint64 height;
+  int64_t x;
+  int64_t y;
+  uint64_t width;
+  uint64_t height;
   NPRect clipRect;
 #if defined(XP_UNIX) && !defined(XP_MACOSX)
   void * ws_info;
@@ -2949,14 +3388,14 @@ g_LONG64_NPP_Destroy(NPP instance, void **save)
 
 // NPP_NewStream (LONG64)
 static NPError
-g_LONG64_NPP_NewStream(NPP instance, NPMIMEType type, void *stream, NPBool seekable, uint16 *stype)
+g_LONG64_NPP_NewStream(NPP instance, NPMIMEType type, void *stream, NPBool seekable, uint16_t *stype)
 {
   if (instance == NULL)
 	return NPERR_INVALID_INSTANCE_ERROR;
 
   // Detect broken 64-bit NPAPI
   if (g_use_long64_thunks < 0) {
-	npw_printf("WARNING: function using an NPStream was called too early, could not determine LONG64 data structure\n");
+	D(bug("WARNING: function using an NPStream was called too early, could not determine LONG64 data structure\n"));
 	set_use_long64_thunks(false);
   }
 
@@ -2993,7 +3432,7 @@ g_LONG64_NPP_DestroyStream(NPP instance, void *stream, NPReason reason)
 }
 
 // NPP_WriteReady (LONG64)
-static int64
+static int64_t
 g_LONG64_NPP_WriteReady(NPP instance, void *stream)
 {
   if (instance == NULL)
@@ -3002,12 +3441,12 @@ g_LONG64_NPP_WriteReady(NPP instance, void *stream)
   if (stream == NULL)
 	return 0;
 
-  return (int64)(int32)g_NPP_WriteReady(instance, NP_STREAM32(stream));
+  return (int64_t)(int32_t)g_NPP_WriteReady(instance, NP_STREAM32(stream));
 }
 
 // NPP_Write (LONG64)
-static int64
-g_LONG64_NPP_Write(NPP instance, void *stream, int64 offset, int64 len, void *buf)
+static int64_t
+g_LONG64_NPP_Write(NPP instance, void *stream, int64_t offset, int64_t len, void *buf)
 {
   if (instance == NULL)
 	return -1L;
@@ -3015,7 +3454,7 @@ g_LONG64_NPP_Write(NPP instance, void *stream, int64 offset, int64 len, void *bu
   if (stream == NULL)
 	return -1L;
 
-  return (int64)(int32)g_NPP_Write(instance, NP_STREAM32(stream), offset, len, buf);
+  return (int64_t)(int32_t)g_NPP_Write(instance, NP_STREAM32(stream), offset, len, buf);
 }
 
 // NPP_StreamAsFile (LONG64)
@@ -3102,66 +3541,43 @@ static bool is_konqueror(void)
 
 // Provides global initialization for a plug-in
 static NPError
-invoke_NP_Initialize(uint32_t npapi_version)
+invoke_NP_Initialize(uint32_t npapi_version,
+					 uint32_t *plugin_version,
+					 uint32_t **plugin_capabilities,
+					 uint32_t *plugin_capabilities_len)
 {
   if (PLUGIN_DIRECT_EXEC) {
-	NPNetscapeFuncs mozilla_funcs;
-	memset(&mozilla_funcs, 0, sizeof(mozilla_funcs));
-	mozilla_funcs.size = sizeof(mozilla_funcs);
-	mozilla_funcs.version = npapi_version;
-	mozilla_funcs.geturl = NewNPN_GetURLProc(g_NPN_GetURL);
-	mozilla_funcs.posturl = NewNPN_PostURLProc(g_NPN_PostURL);
-	mozilla_funcs.requestread = NewNPN_RequestReadProc(g_NPN_RequestRead);
-	mozilla_funcs.newstream = NewNPN_NewStreamProc(g_NPN_NewStream);
-	mozilla_funcs.write = NewNPN_WriteProc(g_NPN_Write);
-	mozilla_funcs.destroystream = NewNPN_DestroyStreamProc(g_NPN_DestroyStream);
-	mozilla_funcs.status = NewNPN_StatusProc(g_NPN_Status);
-	mozilla_funcs.uagent = NewNPN_UserAgentProc(g_NPN_UserAgent);
-	mozilla_funcs.memalloc = NewNPN_MemAllocProc(g_NPN_MemAlloc);
-	mozilla_funcs.memfree = NewNPN_MemFreeProc(g_NPN_MemFree);
-	mozilla_funcs.memflush = NewNPN_MemFlushProc(g_NPN_MemFlush);
-	mozilla_funcs.reloadplugins = NewNPN_ReloadPluginsProc(g_NPN_ReloadPlugins);
-	mozilla_funcs.getJavaEnv = NewNPN_GetJavaEnvProc(g_NPN_GetJavaEnv);
-	mozilla_funcs.getJavaPeer = NewNPN_GetJavaPeerProc(g_NPN_GetJavaPeer);
-	mozilla_funcs.geturlnotify = NewNPN_GetURLNotifyProc(g_NPN_GetURLNotify);
-	mozilla_funcs.posturlnotify = NewNPN_PostURLNotifyProc(g_NPN_PostURLNotify);
-	mozilla_funcs.getvalue = NewNPN_GetValueProc(g_NPN_GetValue);
-	mozilla_funcs.setvalue = NewNPN_SetValueProc(g_NPN_SetValue);
-	mozilla_funcs.invalidaterect = NewNPN_InvalidateRectProc(g_NPN_InvalidateRect);
-	mozilla_funcs.invalidateregion = NewNPN_InvalidateRegionProc(g_NPN_InvalidateRegion);
-	mozilla_funcs.forceredraw = NewNPN_ForceRedrawProc(g_NPN_ForceRedraw);
-	mozilla_funcs.pushpopupsenabledstate = NewNPN_PushPopupsEnabledStateProc(g_NPN_PushPopupsEnabledState);
-	mozilla_funcs.poppopupsenabledstate = NewNPN_PopPopupsEnabledStateProc(g_NPN_PopPopupsEnabledState);
-	if ((npapi_version & 0xff) >= NPVERS_HAS_NPRUNTIME_SCRIPTING) {
-	  mozilla_funcs.getstringidentifier = NewNPN_GetStringIdentifierProc(g_NPN_GetStringIdentifier);
-	  mozilla_funcs.getstringidentifiers = NewNPN_GetStringIdentifiersProc(g_NPN_GetStringIdentifiers);
-	  mozilla_funcs.getintidentifier = NewNPN_GetIntIdentifierProc(g_NPN_GetIntIdentifier);
-	  mozilla_funcs.identifierisstring = NewNPN_IdentifierIsStringProc(g_NPN_IdentifierIsString);
-	  mozilla_funcs.utf8fromidentifier = NewNPN_UTF8FromIdentifierProc(g_NPN_UTF8FromIdentifier);
-	  mozilla_funcs.intfromidentifier = NewNPN_IntFromIdentifierProc(g_NPN_IntFromIdentifier);
-	  mozilla_funcs.createobject = NewNPN_CreateObjectProc(g_NPN_CreateObject);
-	  mozilla_funcs.retainobject = NewNPN_RetainObjectProc(g_NPN_RetainObject);
-	  mozilla_funcs.releaseobject = NewNPN_ReleaseObjectProc(g_NPN_ReleaseObject);
-	  mozilla_funcs.invoke = NewNPN_InvokeProc(g_NPN_Invoke);
-	  mozilla_funcs.invokeDefault = NewNPN_InvokeDefaultProc(g_NPN_InvokeDefault);
-	  mozilla_funcs.evaluate = NewNPN_EvaluateProc(g_NPN_Evaluate);
-	  mozilla_funcs.getproperty = NewNPN_GetPropertyProc(g_NPN_GetProperty);
-	  mozilla_funcs.setproperty = NewNPN_SetPropertyProc(g_NPN_SetProperty);
-	  mozilla_funcs.removeproperty = NewNPN_RemovePropertyProc(g_NPN_RemoveProperty);
-	  mozilla_funcs.hasproperty = NewNPN_HasPropertyProc(g_NPN_HasProperty);
-	  mozilla_funcs.hasmethod = NewNPN_HasMethodProc(g_NPN_HasMethod);
-	  mozilla_funcs.releasevariantvalue = NewNPN_ReleaseVariantValueProc(g_NPN_ReleaseVariantValue);
-	  mozilla_funcs.setexception = NewNPN_SetExceptionProc(g_NPN_SetException);
-	}
-	return g_plugin_NP_Initialize(&mozilla_funcs, &plugin_funcs);
+	NPNetscapeFuncs wrapped_mozilla_funcs;
+	memset(&wrapped_mozilla_funcs, 0, sizeof(wrapped_mozilla_funcs));
+	wrapped_mozilla_funcs.size = sizeof(wrapped_mozilla_funcs);
+	wrapped_mozilla_funcs.version = npapi_version;
+#define BROWSER_FUNC(func, member)					\
+	if (mozilla_funcs.member != NULL)				\
+	  wrapped_mozilla_funcs.member = g_ ## func;
+#include "browser-funcs.h"
+#undef BROWSER_FUNC
+	NPError error = g_plugin_NP_Initialize(&wrapped_mozilla_funcs, &plugin_funcs);
+    *plugin_version = plugin_funcs.version;
+    return error;
   }
 
   npw_return_val_if_fail(rpc_method_invoke_possible(g_rpc_connection),
 						 NPERR_MODULE_LOAD_FAILED_ERROR);
 
+  // Allocate browser capabilities.
+  uint32_t browser_capabilities[] = {
+#define BROWSER_FUNC(func, member)				\
+	(mozilla_funcs.member != NULL) ? 1 : 0,
+#include "browser-funcs.h"
+#undef BROWSER_FUNC
+  };
+
   int error = rpc_method_invoke(g_rpc_connection,
 								RPC_METHOD_NP_INITIALIZE,
 								RPC_TYPE_UINT32, npapi_version,
+								RPC_TYPE_ARRAY, RPC_TYPE_UINT32,
+								G_N_ELEMENTS(browser_capabilities),
+								browser_capabilities,
 								RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
@@ -3170,7 +3586,13 @@ invoke_NP_Initialize(uint32_t npapi_version)
   }
 
   int32_t ret;
-  error = rpc_method_wait_for_reply(g_rpc_connection, RPC_TYPE_INT32, &ret, RPC_TYPE_INVALID);
+  error = rpc_method_wait_for_reply(g_rpc_connection,
+                                    RPC_TYPE_INT32, &ret,
+                                    RPC_TYPE_UINT32, plugin_version,
+									RPC_TYPE_ARRAY, RPC_TYPE_UINT32,
+									plugin_capabilities_len,
+									plugin_capabilities,
+                                    RPC_TYPE_INVALID);
 
   if (error != RPC_ERROR_NO_ERROR) {
 	npw_perror("NP_Initialize() wait for reply", error);
@@ -3181,11 +3603,15 @@ invoke_NP_Initialize(uint32_t npapi_version)
 }
 
 static NPError
-g_NP_Initialize(uint32_t npapi_version)
+g_NP_Initialize(uint32_t npapi_version,
+				uint32_t *plugin_version,
+				uint32_t **plugin_capabilities, uint32_t *plugin_capabilities_len)
 {
   D(bugiI("NP_Initialize\n"));
-  NPError ret = invoke_NP_Initialize(npapi_version);
-  D(bugiD("NP_Initialize return: %d [%s]\n", ret, string_of_NPError(ret)));
+  NPError ret = invoke_NP_Initialize(npapi_version, plugin_version,
+									 plugin_capabilities, plugin_capabilities_len);
+  D(bugiD("NP_Initialize return: %d [%s], plugin_version=%d\n",
+          ret, string_of_NPError(ret), *plugin_version));
   return ret;
 }
 
@@ -3200,52 +3626,53 @@ NP_Initialize(NPNetscapeFuncs *moz_funcs, NPPluginFuncs *plugin_funcs)
   if ((moz_funcs->version >> 8) != NP_VERSION_MAJOR)
     return NPERR_INCOMPATIBLE_VERSION_ERROR;
   // for now, we only need fields up to including forceRedraw
-  if (moz_funcs->size < (offsetof(NPNetscapeFuncs, forceredraw) + sizeof(NPN_ForceRedrawUPP)))
+  if (moz_funcs->size < (offsetof(NPNetscapeFuncs, forceredraw) + sizeof(NPN_ForceRedrawProcPtr)))
     return NPERR_INVALID_FUNCTABLE_ERROR;
-  if (plugin_funcs->size < sizeof(NPPluginFuncs))
-    return NPERR_INVALID_FUNCTABLE_ERROR;
+
+  if (g_plugin.initialized == 0)
+	plugin_init(0);
+  if (g_plugin.initialized <= 0)
+	return NPERR_GENERIC_ERROR;
+
   if (g_plugin.is_wrapper)
 	return NPERR_NO_ERROR;
 
   // copy mozilla_funcs table here as plugin_init() will need it
   memcpy(&mozilla_funcs, moz_funcs, MIN(moz_funcs->size, sizeof(mozilla_funcs)));
 
-  memset(plugin_funcs, 0, sizeof(*plugin_funcs));
-  plugin_funcs->size = sizeof(NPPluginFuncs);
-  plugin_funcs->version = NPW_NPAPI_VERSION;
-  plugin_funcs->newp = NewNPP_NewProc(g_NPP_New);
-  plugin_funcs->destroy = NewNPP_DestroyProc(g_NPP_Destroy);
-  plugin_funcs->setwindow = NewNPP_SetWindowProc(g_NPP_SetWindow);
-  plugin_funcs->newstream = NewNPP_NewStreamProc(g_NPP_NewStream);
-  plugin_funcs->destroystream = NewNPP_DestroyStreamProc(g_NPP_DestroyStream);
-  plugin_funcs->asfile = NewNPP_StreamAsFileProc(g_NPP_StreamAsFile);
-  plugin_funcs->writeready = NewNPP_WriteReadyProc(g_NPP_WriteReady);
-  plugin_funcs->write = NewNPP_WriteProc(g_NPP_Write);
-  plugin_funcs->print = NewNPP_PrintProc(g_NPP_Print);
-  plugin_funcs->event = NewNPP_HandleEventProc(g_NPP_HandleEvent);
-  plugin_funcs->urlnotify = NewNPP_URLNotifyProc(g_NPP_URLNotify);
-  plugin_funcs->javaClass = NULL;
-  plugin_funcs->getvalue = NewNPP_GetValueProc(g_NPP_GetValue);
-  plugin_funcs->setvalue = NewNPP_SetValueProc(g_NPP_SetValue);
+  static NPPluginFuncs full_plugin_funcs;
+  memset(&full_plugin_funcs, 0, sizeof(full_plugin_funcs));
+  full_plugin_funcs.size = sizeof(NPPluginFuncs);
+  full_plugin_funcs.version = NPW_NPAPI_VERSION;
+#define PLUGIN_FUNC(func, member)				\
+  full_plugin_funcs.member = g_ ## func;
+#include "plugin-funcs.h"
+#undef PLUGIN_FUNC
+  full_plugin_funcs.javaClass = NULL;
 
   // override function table with an additional thunking layer for
   // possibly broken 64-bit Konqueror versions (NPAPI 0.11)
-  if (is_konqueror() && sizeof(void *) == 8 && ! NPN_HAS_FEATURE(NPRUNTIME_SCRIPTING)) {
-	D(bug("Installing Konqueror workarounds\n"));
-	plugin_funcs->setwindow = NewNPP_SetWindowProc(g_LONG64_NPP_SetWindow);
-	plugin_funcs->newstream = NewNPP_NewStreamProc(g_LONG64_NPP_NewStream);
-	plugin_funcs->destroystream = NewNPP_DestroyStreamProc(g_LONG64_NPP_DestroyStream);
-	plugin_funcs->asfile = NewNPP_StreamAsFileProc(g_LONG64_NPP_StreamAsFile);
-	plugin_funcs->writeready = NewNPP_WriteReadyProc(g_LONG64_NPP_WriteReady);
-	plugin_funcs->write = NewNPP_WriteProc(g_LONG64_NPP_Write);
-	plugin_funcs->print = NewNPP_PrintProc(g_LONG64_NPP_Print);
-	plugin_funcs->newp = NewNPP_NewProc(g_LONG64_NPP_New);
-	plugin_funcs->destroy = NewNPP_DestroyProc(g_LONG64_NPP_Destroy);
+  if (sizeof(void *) == 8 && ! NPN_HAS_FEATURE(NPRUNTIME_SCRIPTING) && is_konqueror()) {
+    D(bug("Installing Konqueror workarounds\n"));
+    // We're doing sketchy pointer casts, so just cast the function pointers to
+    // make the compiler be quiet. We're doing this intentionally.
+	full_plugin_funcs.setwindow = (NPP_SetWindowProcPtr)g_LONG64_NPP_SetWindow;
+	full_plugin_funcs.newstream = (NPP_NewStreamProcPtr)g_LONG64_NPP_NewStream;
+	full_plugin_funcs.destroystream = (NPP_DestroyStreamProcPtr)g_LONG64_NPP_DestroyStream;
+	full_plugin_funcs.asfile = (NPP_StreamAsFileProcPtr)g_LONG64_NPP_StreamAsFile;
+	full_plugin_funcs.writeready = (NPP_WriteReadyProcPtr)g_LONG64_NPP_WriteReady;
+	full_plugin_funcs.write = (NPP_WriteProcPtr)g_LONG64_NPP_Write;
+	full_plugin_funcs.print = (NPP_PrintProcPtr)g_LONG64_NPP_Print;
+	full_plugin_funcs.newp = (NPP_NewProcPtr)g_LONG64_NPP_New;
+	full_plugin_funcs.destroy = (NPP_DestroyProcPtr)g_LONG64_NPP_Destroy;
   }
 
   // Initialize function tables
   // XXX: remove the local copies from this file
-  NPW_InitializeFuncs(moz_funcs, plugin_funcs);
+  // XXX: This doesn't get the adjust plugin version number below, but don't
+  // use it and someone may try to call something in npw-common.c in the
+  // meantime.
+  NPW_InitializeFuncs(moz_funcs, &full_plugin_funcs);
 
   if (g_plugin.initialized == 0 || g_plugin.initialized == 1)
 	plugin_init(1);
@@ -3260,8 +3687,48 @@ NP_Initialize(NPNetscapeFuncs *moz_funcs, NPPluginFuncs *plugin_funcs)
 
   // pass down common NPAPI version supported by both the underlying
   // browser and the thunking capabilities of nspluginwrapper
-  npapi_version = MIN(moz_funcs->version, plugin_funcs->version);
-  return g_NP_Initialize(npapi_version);
+  D(bug("Thunking layer supports NPAPI %d\n", NPW_NPAPI_VERSION));
+  npapi_version = MIN(moz_funcs->version, NPW_NPAPI_VERSION);
+  D(bug("Browser supports NPAPI %d, advertising version %d to plugin\n",
+        moz_funcs->version, npapi_version));
+  uint32_t plugin_version = 0;
+  uint32_t *plugin_capabilities = NULL;
+  uint32_t plugin_capabilities_len = 0;
+  NPError error = g_NP_Initialize(npapi_version, &plugin_version,
+								  &plugin_capabilities, &plugin_capabilities_len);
+
+  // Likewise, advertise the common NPAPI version between the plugin and our
+  // thunking capabilities.
+  full_plugin_funcs.version = MIN(plugin_version, NPW_NPAPI_VERSION);
+  D(bug("Plugin supports NPAPI %d, advertising version %d to browser\n",
+        plugin_version, full_plugin_funcs.version));
+
+  if (plugin_capabilities) {
+	// Don't advertise any functions the plugin doesn't support.
+	int num = 0;
+#define PLUGIN_FUNC(func, member)								\
+	if (num >= plugin_capabilities_len)	{						\
+	  D(bug("ERROR: provided array was too small.\n"));			\
+	  goto plugin_func_done;									\
+	}															\
+	if (!plugin_capabilities[num]) {							\
+	  D(bug("plugin does not support " #func "\n"));			\
+	  full_plugin_funcs.member = NULL;							\
+	}															\
+	num++;
+#include "plugin-funcs.h"
+#undef PLUGIN_FUNC
+  plugin_func_done:
+	free(plugin_capabilities);
+  }
+
+  // Copy only the portion of full_plugin_funcs that the browser
+  // understands.
+  uint16_t plugin_funcs_size = MIN(plugin_funcs->size, sizeof(full_plugin_funcs));
+  memcpy(plugin_funcs, &full_plugin_funcs, plugin_funcs_size);
+  plugin_funcs->size = plugin_funcs_size;
+
+  return error;
 }
 
 // Provides global deinitialization for a plug-in
@@ -3352,15 +3819,15 @@ static void plugin_init(int is_NP_Initialize)
 
   static int init_count = 0;
   ++init_count;
-  char connection_path[128];
-  sprintf(connection_path, "%s/%s/%d-%d", NPW_CONNECTION_PATH, plugin_file_name, getpid(), init_count);
 
   // Cache MIME info and plugin name/description
-  if (g_plugin.name == NULL && g_plugin.description == NULL && g_plugin.formats == NULL) {
-	char command[1024];
-	if (snprintf(command, sizeof(command), "%s --info --plugin %s", plugin_viewer_path, plugin_path) >= sizeof(command))
-	  return;
+  if (g_plugin.name == NULL &&
+	  g_plugin.description == NULL &&
+	  g_plugin.formats == NULL) {
+	char *command = g_strdup_printf("%s --info --plugin %s",
+									plugin_viewer_path, plugin_path);
 	FILE *viewer_fp = popen(command, "r");
+	g_free(command);
 	if (viewer_fp == NULL)
 	  return;
 	char line[256];
@@ -3404,6 +3871,11 @@ static void plugin_init(int is_NP_Initialize)
   if (!is_NP_Initialize)
 	return;
 
+  char *connection_path =
+	g_strdup_printf("%s/%s/%d-%d/%ld",
+					NPW_CONNECTION_PATH, plugin_file_name,
+					getpid(), init_count, random());
+
   // Start plug-in viewer
   if ((g_plugin.viewer_pid = fork()) == 0) {
 	char *argv[8];
@@ -3426,8 +3898,10 @@ static void plugin_init(int is_NP_Initialize)
   // Initialize browser-side RPC communication channel
   if ((g_rpc_connection = rpc_init_client(connection_path)) == NULL) {
 	npw_printf("ERROR: failed to initialize plugin-side RPC client connection\n");
+	g_free(connection_path);
 	return;
   }
+  g_free(connection_path);
   if (rpc_add_np_marshalers(g_rpc_connection) < 0) {
 	npw_printf("ERROR: failed to initialize browser-side marshalers\n");
 	return;
@@ -3449,9 +3923,9 @@ static void plugin_init(int is_NP_Initialize)
 	{ RPC_METHOD_NPN_PUSH_POPUPS_ENABLED_STATE,			handle_NPN_PushPopupsEnabledState },
 	{ RPC_METHOD_NPN_POP_POPUPS_ENABLED_STATE,			handle_NPN_PopPopupsEnabledState },
 	{ RPC_METHOD_NPN_INVALIDATE_RECT,					handle_NPN_InvalidateRect },
-	{ RPC_METHOD_NPN_CREATE_OBJECT,						handle_NPN_CreateObject },
-	{ RPC_METHOD_NPN_RETAIN_OBJECT,						handle_NPN_RetainObject },
-	{ RPC_METHOD_NPN_RELEASE_OBJECT,					handle_NPN_ReleaseObject },
+	{ RPC_METHOD_NPN_GET_VALUE_FOR_URL,					handle_NPN_GetValueForURL },
+	{ RPC_METHOD_NPN_SET_VALUE_FOR_URL,					handle_NPN_SetValueForURL },
+	{ RPC_METHOD_NPN_GET_AUTHENTICATION_INFO,			handle_NPN_GetAuthenticationInfo },
 	{ RPC_METHOD_NPN_INVOKE,							handle_NPN_Invoke },
 	{ RPC_METHOD_NPN_INVOKE_DEFAULT,					handle_NPN_InvokeDefault },
 	{ RPC_METHOD_NPN_EVALUATE,							handle_NPN_Evaluate },
@@ -3460,6 +3934,8 @@ static void plugin_init(int is_NP_Initialize)
 	{ RPC_METHOD_NPN_REMOVE_PROPERTY,					handle_NPN_RemoveProperty },
 	{ RPC_METHOD_NPN_HAS_PROPERTY,						handle_NPN_HasProperty },
 	{ RPC_METHOD_NPN_HAS_METHOD,						handle_NPN_HasMethod },
+	{ RPC_METHOD_NPN_ENUMERATE,							handle_NPN_Enumerate },
+	{ RPC_METHOD_NPN_CONSTRUCT,							handle_NPN_Construct },
 	{ RPC_METHOD_NPN_SET_EXCEPTION,						handle_NPN_SetException },
 	{ RPC_METHOD_NPN_GET_STRING_IDENTIFIER,				handle_NPN_GetStringIdentifier },
 	{ RPC_METHOD_NPN_GET_STRING_IDENTIFIERS,			handle_NPN_GetStringIdentifiers },
@@ -3467,17 +3943,13 @@ static void plugin_init(int is_NP_Initialize)
 	{ RPC_METHOD_NPN_IDENTIFIER_IS_STRING,				handle_NPN_IdentifierIsString },
 	{ RPC_METHOD_NPN_UTF8_FROM_IDENTIFIER,				handle_NPN_UTF8FromIdentifier },
 	{ RPC_METHOD_NPN_INT_FROM_IDENTIFIER,				handle_NPN_IntFromIdentifier },
-	{ RPC_METHOD_NPCLASS_INVALIDATE,					npclass_handle_Invalidate },
-	{ RPC_METHOD_NPCLASS_HAS_METHOD,					npclass_handle_HasMethod },
-	{ RPC_METHOD_NPCLASS_INVOKE,						npclass_handle_Invoke },
-	{ RPC_METHOD_NPCLASS_INVOKE_DEFAULT,				npclass_handle_InvokeDefault },
-	{ RPC_METHOD_NPCLASS_HAS_PROPERTY,					npclass_handle_HasProperty },
-	{ RPC_METHOD_NPCLASS_GET_PROPERTY,					npclass_handle_GetProperty },
-	{ RPC_METHOD_NPCLASS_SET_PROPERTY,					npclass_handle_SetProperty },
-	{ RPC_METHOD_NPCLASS_REMOVE_PROPERTY,				npclass_handle_RemoveProperty },
   };
   if (rpc_connection_add_method_descriptors(g_rpc_connection, vtable, sizeof(vtable) / sizeof(vtable[0])) < 0) {
 	npw_printf("ERROR: failed to setup NPN method callbacks\n");
+	return;
+  }
+  if (npclass_add_method_descriptors(g_rpc_connection) < 0) {
+	npw_printf("ERROR: failed to setup NPClass method callbacks\n");
 	return;
   }
 
@@ -3488,28 +3960,19 @@ static void plugin_init(int is_NP_Initialize)
   mozilla_funcs.getvalue(NULL, NPNVToolkit, (void *)&toolkit);
 
   // Initialize RPC events listener, try to attach it to the main event loop
-  if (toolkit == NPNVGtk12 || toolkit == NPNVGtk2) {	// GLib
+  if (toolkit == NPNVGtk12 || toolkit == NPNVGtk2
+	  || toolkit == 0xFEEDABEE) {  // GLib
+	// We use the glib event loop in Konqueror (0xFEEDABEE) because
+	// its Xt event loop bridge is completely broken and non-functional.
 	D(bug("  trying to attach RPC listener to main GLib event loop\n"));
-	static GSourceFuncs rpc_event_funcs = {
-	  rpc_event_prepare,
-	  rpc_event_check,
-	  rpc_event_dispatch,
-	  (void (*)(GSource *))g_free,
-	  (GSourceFunc)NULL,
-	  (GSourceDummyMarshal)NULL
-	};
-	g_rpc_source = g_source_new(&rpc_event_funcs, sizeof(GSource));
-	if (g_rpc_source) {
-	  g_source_set_priority(g_rpc_source, G_PRIORITY_LOW);
-	  g_source_set_callback(g_rpc_source, (GSourceFunc)rpc_dispatch, g_rpc_connection, NULL); 
-	  g_source_attach(g_rpc_source, NULL);
-	  g_rpc_poll_fd.fd = rpc_socket(g_rpc_connection);
-	  g_rpc_poll_fd.events = G_IO_IN;
-	  g_rpc_poll_fd.revents = 0;
-	  g_source_add_poll(g_rpc_source, &g_rpc_poll_fd);
-	}
-  }
-  if (g_rpc_source == NULL) {							// X11
+	g_rpc_source = rpc_event_source_new(g_rpc_connection);
+	g_source_set_priority(g_rpc_source, G_PRIORITY_LOW);
+	g_source_attach(g_rpc_source, NULL);
+
+	g_rpc_sync_source = rpc_sync_source_new(g_rpc_connection);
+	g_source_set_priority(g_rpc_sync_source, G_PRIORITY_HIGH);
+	g_source_attach(g_rpc_sync_source, NULL);
+  } else {							// X11
 	D(bug("  trying to attach RPC listener to main X11 event loop\n"));
 	XtAppContext x_app_context = NULL;
 	int error = mozilla_funcs.getvalue(NULL, NPNVxtAppContext, (void *)&x_app_context);
@@ -3525,9 +3988,12 @@ static void plugin_init(int is_NP_Initialize)
 									   rpc_socket(g_rpc_connection),
 									   (XtPointer)XtInputReadMask,
 									   (XtInputCallbackProc)rpc_dispatch, g_rpc_connection);
+	  xt_rpc_sync_id = XtAppAddBlockHook(x_app_context,
+										 (XtBlockHookProc)rpc_dispatch_pending_sync,
+										 g_rpc_connection);
 	}
   }
-  if (g_rpc_source == NULL && xt_rpc_source_id == 0) {
+  if (g_rpc_source == NULL && (xt_rpc_source_id == 0 || xt_rpc_sync_id == 0)) {
 	npw_printf("ERROR: failed to initialize brower-side RPC events listener\n");
 	return;
   }
@@ -3548,10 +4014,18 @@ static void plugin_exit(void)
 	XtRemoveInput(xt_rpc_source_id);
 	xt_rpc_source_id = 0;
   }
+  if (xt_rpc_sync_id) {
+	XtRemoveBlockHook(xt_rpc_sync_id);
+	xt_rpc_sync_id = 0;
+  }
 
   if (g_rpc_source) {
 	g_source_destroy(g_rpc_source);
 	g_rpc_source = NULL;
+  }
+  if (g_rpc_sync_source) {
+	g_source_destroy(g_rpc_sync_source);
+	g_rpc_sync_source = NULL;
   }
 
   if (g_rpc_connection) {
@@ -3655,7 +4129,15 @@ static NPError plugin_start(void)
   if (g_plugin.initialized <= 0)
 	return NPERR_MODULE_LOAD_FAILED_ERROR;
 
-  return g_NP_Initialize(npapi_version);
+  uint32_t plugin_version;
+  uint32_t *plugin_capabilities = NULL;
+  uint32_t plugin_capabilities_len;
+  NPError ret = g_NP_Initialize(npapi_version, &plugin_version,
+								&plugin_capabilities, &plugin_capabilities_len);
+  // Assume capabilities unchanged.
+  if (plugin_capabilities)
+	free(plugin_capabilities);
+  return ret;
 }
 
 static NPError plugin_start_if_needed(void)

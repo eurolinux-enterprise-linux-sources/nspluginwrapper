@@ -31,6 +31,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <elf.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -38,6 +39,7 @@
 #include <pwd.h>
 #include <dirent.h>
 
+#include <glib.h>
 
 static bool g_auto = false;
 static bool g_verbose = false;
@@ -53,22 +55,6 @@ static void error(const char *format, ...)
   fprintf(stderr, "\n");
   va_end(args);
   exit(1);
-}
-
-static int strstart(const char *str, const char *val, const char **ptr)
-{
-  const char *p, *q;
-  p = str;
-  q = val;
-  while (*q != '\0') {
-	if (*p != *q)
-	  return 0;
-	p++;
-	q++;
-  }
-  if (ptr)
-	*ptr = p;
-  return 1;
 }
 
 static const char *strnstr(const char *str, int len, const char *substr)
@@ -134,44 +120,6 @@ static int strexpand(char *dst, int dstlen, const char *src, int srclen, const V
   }
   dst[n] = '\0';
   return 0;
-}
-
-/* Implement mkdir -p with default permissions (derived from busybox code) */
-static int mkdir_p(const char *path)
-{
-  char path_copy[strlen(path) + 1];
-  char *s = path_copy;
-  path = strcpy(s, path);
-  for (;;) {
-	char c = 0;
-	while (*s) {
-	  if (*s == '/') {
-		while (*++s == '/')
-		  ;
-		c = *s;
-		*s = 0;
-		break;
-	  }
-	  ++s;
-	}
-	if (mkdir(path, 0755) < 0) {
-	  struct stat st;
-	  if ((errno != EEXIST && errno != EISDIR) || stat(path, &st) < 0 || !S_ISDIR(st.st_mode))
-		break;
-	}
-	if ((*s = c) == '\0')
-	  return 0;
-  }
-  return -1;
-}
-
-static const char *get_user_home_dir(void)
-{
-  struct passwd *pwent = getpwuid(geteuid());
-  if (pwent)
-	return pwent->pw_dir;
-
-  return getenv("HOME");
 }
 
 static const char *get_system_mozilla_plugin_dir(void)
@@ -255,13 +203,15 @@ static const char *get_system_mozilla_plugin_dir(void)
 static const char *get_user_mozilla_plugin_dir(void)
 {
   const char *home;
-  static char plugin_path[PATH_MAX];
+  static char *plugin_path = NULL;
 
-  if ((home = get_user_home_dir()) == NULL)
+  if (plugin_path != NULL)
+	return plugin_path;
+
+  if ((home = g_get_home_dir()) == NULL)
 	return NULL;
 
-  sprintf(plugin_path, "%s/.mozilla/plugins", home);
-  return plugin_path;
+  return (plugin_path = g_build_filename(home, ".mozilla", "plugins", NULL));
 }
 
 static const char **get_mozilla_plugin_dirs(void)
@@ -340,162 +290,11 @@ static const char **get_mozilla_plugin_dirs(void)
       (((x) & 0x0000000000ff0000) << 24)  | (((x) & 0x00000000ff000000) <<  8) \
      )
 
-/* 32-bit ELF base types. */
-typedef uint32_t	Elf32_Addr;
-typedef uint16_t   	Elf32_Half;
-typedef uint32_t	Elf32_Off;
-typedef int32_t		Elf32_Sword;
-typedef uint32_t	Elf32_Word;
-
-/* 64-bit ELF base types. */
-typedef uint64_t	Elf64_Addr;
-typedef uint16_t	Elf64_Half;
-typedef int16_t		Elf64_SHalf;
-typedef uint64_t	Elf64_Off;
-typedef int32_t		Elf64_Sword;
-typedef uint32_t	Elf64_Word;
-typedef uint64_t	Elf64_Xword;
-typedef int64_t		Elf64_Sxword;
-
-/* The ELF file header.  This appears at the start of every ELF file.  */
-#define EI_NIDENT (16)
-
-typedef struct
-{
-  unsigned char	e_ident[EI_NIDENT];	/* Magic number and other info */
-  Elf32_Half	e_type;			/* Object file type */
-  Elf32_Half	e_machine;		/* Architecture */
-  Elf32_Word	e_version;		/* Object file version */
-  Elf32_Addr	e_entry;		/* Entry point virtual address */
-  Elf32_Off	e_phoff;		/* Program header table file offset */
-  Elf32_Off	e_shoff;		/* Section header table file offset */
-  Elf32_Word	e_flags;		/* Processor-specific flags */
-  Elf32_Half	e_ehsize;		/* ELF header size in bytes */
-  Elf32_Half	e_phentsize;		/* Program header table entry size */
-  Elf32_Half	e_phnum;		/* Program header table entry count */
-  Elf32_Half	e_shentsize;		/* Section header table entry size */
-  Elf32_Half	e_shnum;		/* Section header table entry count */
-  Elf32_Half	e_shstrndx;		/* Section header string table index */
-} Elf32_Ehdr;
-
-typedef struct
-{
-  unsigned char e_ident[EI_NIDENT];     /* ELF "magic number" */
-  Elf64_Half 	e_type;
-  Elf64_Half 	e_machine;
-  Elf64_Word 	e_version;
-  Elf64_Addr 	e_entry;		/* Entry point virtual address */
-  Elf64_Off 	e_phoff;		/* Program header table file offset */
-  Elf64_Off 	e_shoff;		/* Section header table file offset */
-  Elf64_Word 	e_flags;
-  Elf64_Half 	e_ehsize;
-  Elf64_Half 	e_phentsize;
-  Elf64_Half 	e_phnum;
-  Elf64_Half 	e_shentsize;
-  Elf64_Half 	e_shnum;
-  Elf64_Half 	e_shstrndx;
-} Elf64_Ehdr;
-
 /* Base structure - used to distinguish between 32/64 bit version */
 typedef struct
 {
   unsigned char	e_ident[EI_NIDENT];	/* Magic number and other info */
 } Elf_hdr_base;
-
-#define EI_MAG0		0		/* File identification byte 0 index */
-#define ELFMAG0		0x7f		/* Magic number byte 0 */
-#define EI_MAG1		1		/* File identification byte 1 index */
-#define ELFMAG1		'E'		/* Magic number byte 1 */
-#define EI_MAG2		2		/* File identification byte 2 index */
-#define ELFMAG2		'L'		/* Magic number byte 2 */
-#define EI_MAG3		3		/* File identification byte 3 index */
-#define ELFMAG3		'F'		/* Magic number byte 3 */
-#define EI_CLASS	4		/* File class byte index */
-#define ELFCLASS32	1		/* 32-bit objects */
-#define ELFCLASS64	2		/* 64-bit objects */
-#define EI_DATA		5		/* Data encoding byte index */
-#define ELFDATA2LSB	1		/* 2's complement, little endian */
-#define ELFDATA2MSB	2		/* 2's complement, big endian */
-#define EI_OSABI	7		/* OS ABI identification */
-#define ELFOSABI_SYSV	0		/* UNIX System V ABI */
-#define ELFOSABI_NETBSD	2		/* NetBSD.  */
-#define ELFOSABI_LINUX	3		/* Linux.  */
-#define ELFOSABI_SOLARIS 6		/* Sun Solaris.  */
-#define ELFOSABI_FREEBSD 9		/* FreeBSD.  */
-#define ET_DYN		3		/* Shared object file */
-#define EM_386		3		/* Intel 80386 */
-#define EM_SPARC	2		/* SUN SPARC */
-#define EM_PPC		20		/* PowerPC */
-#define EM_PPC64	21		/* PowerPC 64-bit */
-#define EM_SPARCV9	43		/* SPARC v9 64-bit */
-#define EM_IA_64	50		/* Intel Merced */
-#define EM_X86_64	62		/* AMD x86-64 architecture */
-#define EV_CURRENT	1		/* Current version */
-
-/* Section header.  */
-typedef struct
-{
-  Elf32_Word	sh_name;		/* Section name (string tbl index) */
-  Elf32_Word	sh_type;		/* Section type */
-  Elf32_Word	sh_flags;		/* Section flags */
-  Elf32_Addr	sh_addr;		/* Section virtual addr at execution */
-  Elf32_Off	sh_offset;		/* Section file offset */
-  Elf32_Word	sh_size;		/* Section size in bytes */
-  Elf32_Word	sh_link;		/* Link to another section */
-  Elf32_Word	sh_info;		/* Additional section information */
-  Elf32_Word	sh_addralign;		/* Section alignment */
-  Elf32_Word	sh_entsize;		/* Entry size if section holds table */
-} Elf32_Shdr;
-
-typedef struct
-{
-  Elf64_Word 	sh_name;           	/* Section name, index in string tbl */
-  Elf64_Word 	sh_type;           	/* Type of section */
-  Elf64_Xword 	sh_flags;         	/* Miscellaneous section attributes */
-  Elf64_Addr 	sh_addr;           	/* Section virtual addr at execution */
-  Elf64_Off 	sh_offset;          	/* Section file offset */
-  Elf64_Xword 	sh_size;          	/* Size of section in bytes */
-  Elf64_Word 	sh_link;           	/* Index of another section */
-  Elf64_Word 	sh_info;           	/* Additional section information */
-  Elf64_Xword 	sh_addralign;     	/* Section alignment */
-  Elf64_Xword 	sh_entsize;       	/* Entry size if section holds table */
-} Elf64_Shdr;
-
-
-#define SHT_NOBITS	  8		/* Program space with no data (bss) */
-#define SHT_DYNSYM	  11		/* Dynamic linker symbol table */
-
-/* Symbol table entry.  */
-typedef struct
-{
-  Elf32_Word	st_name;		/* Symbol name (string tbl index) */
-  Elf32_Addr	st_value;		/* Symbol value */
-  Elf32_Word	st_size;		/* Symbol size */
-  unsigned char	st_info;		/* Symbol type and binding */
-  unsigned char	st_other;		/* Symbol visibility */
-  Elf32_Half	st_shndx;		/* Section index */
-} Elf32_Sym;
-
-typedef struct
-{
-  Elf64_Word 	st_name;       		/* Symbol name, index in string tbl */
-  unsigned char st_info;    	   	/* Type and binding attributes */
-  unsigned char st_other;	      	/* No defined meaning, 0 */
-  Elf64_Half 	st_shndx;         	/* Associated section index */
-  Elf64_Addr 	st_value;          	/* Value of the symbol */
-  Elf64_Xword 	st_size;          	/* Associated symbol size */
-} Elf64_Sym;
-
-#define ELF_ST_BIND(x)          ((x) >> 4)
-#define ELF_ST_TYPE(x)          (((unsigned int) x) & 0xf)
-#define ELF32_ST_BIND(x)        ELF_ST_BIND(x)
-#define ELF32_ST_TYPE(x)        ELF_ST_TYPE(x)
-#define ELF64_ST_BIND(x)        ELF_ST_BIND(x)
-#define ELF64_ST_TYPE(x)        ELF_ST_TYPE(x)
-
-#define STB_GLOBAL	1		/* Global symbol */
-#define STT_OBJECT	1		/* Symbol is a data object */
-#define STT_FUNC	2		/* Symbol is a code object */
 
 void *load_data(int fd, long offset, unsigned int size)
 {
@@ -563,7 +362,9 @@ static bool is_plugin_viewer_ok(const char *viewer_path, const char *filename)
 	if (!g_verbose) {
 	  // don't spit out errors in non-verbose mode, we only need
 	  // to know whether there is a valid viewer or not
-	  freopen("/dev/null", "w", stderr);
+	  if (freopen("/dev/null", "w", stderr) == NULL) {
+		fprintf(stderr, "failed to silence stderr\n");
+	  }
 	}
 	execl(viewer_path, NPW_VIEWER, "--test", "--plugin", filename, NULL);
 	exit(1);
@@ -733,7 +534,8 @@ static bool is_wrapper_plugin(const char *plugin_path, NPW_PluginInfo *out_plugi
 	return false;
 
   bool ret = is_wrapper_plugin_handle(handle, out_plugin_info);
-  dlclose(handle);
+  /* Intentionally leak the handle; many libraries crash when unloaded. */
+  /* dlclose(handle); */
   return ret;
 }
 
@@ -795,7 +597,7 @@ static bool match_path_prefix(const char *path, const char *prefix)
 static bool is_user_home_path(const char *path)
 {
   const char *homedir;
-  if ((homedir = get_user_home_dir()) == NULL)
+  if ((homedir = g_get_home_dir()) == NULL)
 	return false;
   return match_path_prefix(path, homedir);
 }
@@ -825,24 +627,15 @@ static int process_plugin_dir(const char *plugin_dir, is_plugin_cb test, process
   if (dir == NULL)
 	return -1;
 
-  int plugin_path_length = 256;
-  char *plugin_path = (char *)malloc(plugin_path_length);
-  int plugin_dir_length = strlen(plugin_dir);
-
   struct dirent *ent;
   while ((ent = readdir(dir)) != NULL) {
-	int len = plugin_dir_length + 1 + strlen(ent->d_name) + 1;
-	if (len > plugin_path_length) {
-	  plugin_path_length = len;
-	  plugin_path = (char *)realloc(plugin_path, plugin_path_length);
-	}
-	sprintf(plugin_path, "%s/%s", plugin_dir, ent->d_name);
+	char *plugin_path = g_build_filename(plugin_dir, ent->d_name, NULL);
 	NPW_PluginInfo plugin_info;
 	if (test(plugin_path, &plugin_info))
 	  process(plugin_path, &plugin_info);
+	g_free(plugin_path);
   }
 
-  free(plugin_path);
   closedir(dir);
   return 0;
 }
@@ -929,13 +722,10 @@ static int do_install_plugin(const char *plugin_path, const char *plugin_dir, NP
 	  !is_root_only_accessible_plugin(plugin_dir))
 	mode = 0755;
 
-  int d_fd = open(d_plugin_path, O_CREAT | O_WRONLY, mode);
-  if (d_fd < 0)
-	return 4;
-
-  if (write(d_fd, plugin_data, w_size) != w_size)
-	return 13;
-  close(d_fd);
+  // TODO: Don't swallow the error message. Also get rid of these ridiculous
+  // return codes. They're never acted on anyway. Use GError or something.
+  if (!g_file_set_contents(d_plugin_path, plugin_data, w_size, NULL))
+    return 4;
 
   if (g_verbose)
 	printf("  into %s\n", d_plugin_path);
@@ -966,7 +756,8 @@ static int install_plugin(const char *plugin_path, NPW_PluginInfo *plugin_info)
   }
 
   const char *user_plugin_dir = get_user_mozilla_plugin_dir();
-  if (access(user_plugin_dir, R_OK | W_OK) < 0 && mkdir_p(user_plugin_dir) < 0)
+  if (access(user_plugin_dir, R_OK | W_OK) < 0 &&
+	  g_mkdir_with_parents(user_plugin_dir, 0755) < 0)
 	return 1;
 
   ret = do_install_plugin(plugin_path, user_plugin_dir, plugin_info);
@@ -1042,7 +833,7 @@ static int update_plugin(const char *plugin_path)
 	ret = remove_plugin(plugin_path);
   }
   else if (has_system_wide_wrapper_plugin(plugin_info.path, true)
-		   && !strstart(plugin_path, get_system_mozilla_plugin_dir(), NULL)) {
+		   && !g_str_has_prefix(plugin_path, get_system_mozilla_plugin_dir())) {
 	if (g_verbose)
 	  printf("  NPAPI plugin %s is already installed system-wide, removing wrapper\n", plugin_info.path);
 	ret = remove_plugin(plugin_path);
@@ -1069,6 +860,10 @@ static int update_plugin(const char *plugin_path)
 	if (g_verbose)
 	  printf("  nspluginwrapper ident mismatch, reinstalling plugin\n");
 	ret = install_plugin(plugin_info.path, &plugin_info);
+  }
+  else {
+	if (g_verbose)
+	  printf("  wrapper ident matches and NPAPI plugin is unmodified, skipping\n");
   }
 
   return ret;
@@ -1141,7 +936,7 @@ static void print_usage(void)
   printf("   -a --auto               flag: set automatic mode for plugins discovery\n");
   printf("   -n --native             flag: allow native plugin(s) to be wrapped\n");
   printf("   -l --list               list plugins currently installed\n");
-  printf("   -u --update             update plugin(s) currently installed\n");
+  printf("   -u --update [FILE(S)]   update plugin(s) currently installed\n");
   printf("   -i --install [FILE(S)]  install plugin(s)\n");
   printf("   -r --remove [FILE(S)]   remove plugin(s)\n");
   printf("\n");
